@@ -118,6 +118,16 @@ public class Engine {
     /** 本次任务的完整轨迹，失败时整段给用户复制。 */
     final StringBuilder trace = new StringBuilder();
 
+    /** 引擎：0 = ALH Frame Lite（ffmpeg minterpolate），1 = ALH Frame Standard（自研内核）。 */
+    static final int MODE_LITE = 0;
+    static final int MODE_PRO = 1;
+
+    int mode = MODE_LITE;
+    /** 去重复帧：前后帧几乎一致时直接复制，不插值（Pro 内核支持）。 */
+    boolean dedup;
+    /** Pro 内核可执行文件路径；为空表示当前架构没有内核，自动回落 Lite。 */
+    String proBin;
+
     public Engine(Context c, Cb cb) {
         this.ctx = c.getApplicationContext();
         this.cb = cb;
@@ -272,6 +282,18 @@ public class Engine {
     // ------------------------------------------------------------------ 主流程
 
     public void start(final File src, final int mult, final File outDir) {
+        start(src, mult, outDir, MODE_LITE, false);
+    }
+
+    public void start(final File src, final int mult, final File outDir,
+                      final int engineMode, final boolean dedupOn) {
+        this.mode = engineMode;
+        this.dedup = dedupOn;
+        this.proBin = engineMode == MODE_PRO ? Pro.bin(ctx) : null;
+        if (engineMode == MODE_PRO && proBin == null) {
+            note("pro", "当前架构没有自研内核，回落 Lite");
+            this.mode = MODE_LITE;
+        }
         new Thread(new Runnable() {
             public void run() {
                 try {
@@ -622,6 +644,14 @@ public class Engine {
                 }
             }
             String dur = fmt(want);
+            if (mode == MODE_PRO && proBin != null && attempt == 0) {
+                runPro(ss, want);
+                return;
+            }
+            if (mode == MODE_PRO && proBin != null) {
+                // 自研内核这一档没跑通，重跑时换成 ffmpeg 路径：宁可慢一点也要出片
+                note("pro", out.getName() + " 改走 Lite 路径重跑");
+            }
             StringBuilder vf = new StringBuilder();
             // 两条禁忌，都实测过：
             // 1) 不能用 pad —— ffmpeg 9.0.2 在 1080×1620 上 pad+minterpolate 必崩，不补边反而正常；
@@ -750,6 +780,109 @@ public class Engine {
                     if (localFrames > 0 && localFrames < frames - 2) {
                         failure = "分段帧数不足（本段 " + localFrames + "/" + frames + " 帧）";
                         errors.add(failure);
+                    }
+                }
+            } catch (Exception e) {
+                if (p != null) {
+                    procs.remove(p);
+                }
+                note("cmd", out.getName() + " 启动/读取异常: " + shortErr(e));
+                if (!cancel) {
+                    failure = "分段编码失败（启动阶段）：" + shortErr(e);
+                    errors.add(failure);
+                }
+            }
+        }
+
+        /** 单引号包裹，供 /system/bin/sh 使用。 */
+        String q(String s) {
+            return "'" + s.replace("'", "'\\''") + "'";
+        }
+
+        /**
+         * ALH Frame Standard 的分段编码：ffmpeg 解码 → 自研内核插帧 → ffmpeg 编码封装成 TS 段。
+         * 三段用同一个 sh 管道串起来，按最后一段的退出码判定成败。
+         */
+        void runPro(String ss, double want) {
+            int nfr = Math.max(2, (int) Math.round(want * srcFps));
+            final int opt = 4 | (dedup ? 4096 : 0);
+            int f0 = (int) Math.round(tStart * outFps);
+            String vf = "trim=end_frame=" + frames
+                    + ",setpts=N/(" + fmt(outFps) + "*TB)+" + f0 + "/(" + fmt(outFps) + "*TB)";
+            StringBuilder sb = new StringBuilder();
+            sb.append(q(ff)).append(" -hide_banner -nostdin -v error -ss ").append(ss)
+                    .append(" -t ").append(fmt(want))
+                    .append(" -i ").append(q(src.getAbsolutePath()))
+                    .append(" -an -f rawvideo -pix_fmt yuv420p -");
+            sb.append(" | ").append(q(proBin)).append(" - ").append(vw).append(' ').append(vh)
+                    .append(' ').append(nfr).append(" - ").append(mult).append(' ').append(opt);
+            sb.append(" | ").append(q(ff))
+                    .append(" -hide_banner -nostdin -v error -y -f rawvideo -pix_fmt yuv420p -s ")
+                    .append(vw).append('x').append(vh).append(" -r ").append(fmt(outFps))
+                    .append(" -i - -vf ").append(q(vf))
+                    .append(" -c:v libx264 -preset veryfast -threads ").append(attempt == 0 ? "2" : "1")
+                    .append(" -crf 19 -pix_fmt yuv420p -f mpegts -muxdelay 0 -muxpreload 0 -bf 0 ")
+                    .append(q(out.getAbsolutePath()));
+
+            note("cmd", out.getName() + " [" + (dedup ? "Pro+去重" : "Pro") + "] ("
+                    + fmt(tStart) + "s–" + fmt(tEnd) + "s, 输出 " + frames + " 帧, 输入约 "
+                    + nfr + " 帧) " + sb);
+
+            Process p = null;
+            final StringBuilder err = new StringBuilder();
+            try {
+                p = new ProcessBuilder("/system/bin/sh", "-c", sb.toString()).start();
+                procs.add(p);
+                final Process fp = p;
+                Thread et = new Thread(new Runnable() {
+                    public void run() {
+                        try {
+                            BufferedReader br = new BufferedReader(
+                                    new InputStreamReader(fp.getErrorStream()), 8192);
+                            String l;
+                            while ((l = br.readLine()) != null) {
+                                if (l.startsWith("k=")) {
+                                    int e = 2;
+                                    while (e < l.length() && Character.isDigit(l.charAt(e))) {
+                                        e++;
+                                    }
+                                    try {
+                                        int k = Integer.parseInt(l.substring(2, e));
+                                        int d = (k + 1) * mult - localFrames;
+                                        if (d > 0) {
+                                            localFrames += d;
+                                            report(doneFrames.addAndGet(d));
+                                        }
+                                    } catch (Throwable ignored) {
+                                    }
+                                } else if (l.startsWith("wrote ")) {
+                                    note("pro", out.getName() + " " + l);
+                                } else if (err.length() < 3000) {
+                                    err.append(l).append('\n');
+                                }
+                            }
+                            br.close();
+                        } catch (Throwable ignored) {
+                        }
+                    }
+                }, "proerr");
+                et.start();
+                drain(p.getInputStream());
+                et.join();
+                int rc = p.waitFor();
+                procs.remove(p);
+                note("cmd", out.getName() + " 退出码 " + rc
+                        + (rc == 0 ? "" : " · stderr 尾部: " + oneLine(err.toString())));
+                if (rc != 0 && !cancel) {
+                    failure = "分段编码失败（本段已输出 " + localFrames + "/" + frames + " 帧）："
+                            + tail(err, rc);
+                    errors.add(failure);
+                } else if (rc == 0) {
+                    failure = null;
+                    int d = frames - localFrames;
+                    if (d > 0) {
+                        localFrames = frames;
+                        report(doneFrames.addAndGet(d));
                     }
                 }
             } catch (Exception e) {

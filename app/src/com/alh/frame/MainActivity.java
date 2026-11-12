@@ -61,6 +61,12 @@ public class MainActivity extends Activity {
     TextView tvSub;
     Button btnPick;
     Button btnStart;
+    /** 引擎选择：0 = ALH Frame Lite，1 = ALH Frame Standard。 */
+    int engineMode = 0;
+    boolean dedup = false;
+    final Button[] engBtns = new Button[2];
+    TextView tvEngineNote;
+    Button btnDedup;
     Button btnCancel;
     Bar bar;
     LinearLayout boxProgress;
@@ -252,8 +258,54 @@ public class MainActivity extends Activity {
             seg.addView(bt, p);
             mulBtns[i] = bt;
         }
-        col.addView(seg, lp(-1, -2, 0, 0, 0, dp(26)));
+        col.addView(seg, lp(-1, -2, 0, 0, 0, dp(22)));
         setMult(0);
+
+        // 引擎选择：Lite 走 ffmpeg minterpolate，Pro 走自研内核（有去重复帧）
+        TextView elabel = text("补帧引擎", 12, C_DIM, false);
+        elabel.setLetterSpacing(0.08f);
+        col.addView(elabel, lp(-1, -2, dp(2), 0, 0, dp(10)));
+
+        LinearLayout eseg = new LinearLayout(this);
+        eseg.setOrientation(LinearLayout.HORIZONTAL);
+        eseg.setBackground(round(C_OFF, dp(14)));
+        eseg.setPadding(dp(4), dp(4), dp(4), dp(4));
+        String[] names = {"ALH Frame Lite", "ALH Frame Standard"};
+        for (int i = 0; i < names.length; i++) {
+            final int idx = i;
+            Button bt = button(names[i], false);
+            bt.setBackground(round(0x00000000, dp(10)));
+            bt.setTextColor(C_DIM);
+            bt.setOnClickListener(new View.OnClickListener() {
+                public void onClick(View v) {
+                    if (running) {
+                        return;
+                    }
+                    setEngine(idx);
+                }
+            });
+            LinearLayout.LayoutParams p = lp(0, dp(40), 0, 0, 0, 0);
+            p.weight = 1f;
+            eseg.addView(bt, p);
+            engBtns[i] = bt;
+        }
+        col.addView(eseg, lp(-1, -2, 0, dp(10), 0, 0));
+
+        tvEngineNote = text("", 12, C_DIM, false);
+        tvEngineNote.setLineSpacing(dp(2), 1f);
+        col.addView(tvEngineNote, lp(-1, -2, dp(2), dp(6), 0, 0));
+
+        btnDedup = button("去重复帧 关", false);
+        btnDedup.setOnClickListener(new View.OnClickListener() {
+            public void onClick(View v) {
+                if (running) {
+                    return;
+                }
+                setDedup(!dedup);
+            }
+        });
+        col.addView(btnDedup, lp(-1, dp(44), 0, dp(6), 0, dp(24)));
+        setEngine(0);
 
         btnStart = button("开始处理", true);
         btnStart.setOnClickListener(new View.OnClickListener() {
@@ -408,6 +460,46 @@ public class MainActivity extends Activity {
 
     // ------------------------------------------------------------------ 流程
 
+    private void setEngine(int e) {
+        engineMode = e;
+        for (int i = 0; i < engBtns.length; i++) {
+            if (engBtns[i] == null) {
+                continue;
+            }
+            if (i == e) {
+                engBtns[i].setBackground(round(C_ACC, dp(10)));
+                engBtns[i].setTextColor(-1);
+            } else {
+                engBtns[i].setBackground(round(0x00000000, dp(10)));
+                engBtns[i].setTextColor(C_DIM);
+            }
+        }
+        if (tvEngineNote != null) {
+            tvEngineNote.setText(e == 1
+                    ? "自研运动估计内核：低分辨率更清晰，速度快约一倍，边缘伪影更少。"
+                    : "ffmpeg 运动补偿插帧：兼容性最好，高分辨率下更稳。");
+        }
+        if (btnDedup != null) {
+            btnDedup.setEnabled(e == 1);
+            btnDedup.setTextColor(e == 1 ? (dedup ? -1 : C_TEXT) : C_DIM);
+            btnDedup.setBackground(round(e == 1 && dedup ? C_ACC : C_OFF, dp(12)));
+            btnDedup.setText(dedup ? "去重复帧 开" : "去重复帧 关");
+            if (e != 1) {
+                dedup = false;
+                btnDedup.setText("去重复帧 关");
+            }
+        }
+    }
+
+    private void setDedup(boolean on) {
+        dedup = on;
+        if (btnDedup != null) {
+            btnDedup.setText(on ? "去重复帧 开" : "去重复帧 关");
+            btnDedup.setBackground(round(on ? C_ACC : C_OFF, dp(12)));
+            btnDedup.setTextColor(on ? -1 : C_TEXT);
+        }
+    }
+
     private void start() {
         if (running) {
             return;
@@ -431,6 +523,14 @@ public class MainActivity extends Activity {
         btnStart.setEnabled(false);
         for (Button b : mulBtns) {
             b.setEnabled(false);
+        }
+        for (Button b : engBtns) {
+            if (b != null) {
+                b.setEnabled(false);
+            }
+        }
+        if (btnDedup != null) {
+            btnDedup.setEnabled(false);
         }
         boxProgress.setVisibility(View.VISIBLE);
         bar.setVisibility(View.VISIBLE);
@@ -509,7 +609,7 @@ public class MainActivity extends Activity {
                 });
             }
         });
-        engine.start(picked, mult, null);
+        engine.start(picked, mult, null, engineMode, dedup);
     }
 
     private void finishUi() {
@@ -520,6 +620,14 @@ public class MainActivity extends Activity {
         btnStart.setEnabled(true);
         for (Button b : mulBtns) {
             b.setEnabled(true);
+        }
+        for (Button b : engBtns) {
+            if (b != null) {
+                b.setEnabled(true);
+            }
+        }
+        if (btnDedup != null) {
+            btnDedup.setEnabled(engineMode == 1);
         }
         btnCancel.setVisibility(View.GONE);
         getWindow().clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);

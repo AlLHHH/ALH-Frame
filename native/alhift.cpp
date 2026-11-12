@@ -369,7 +369,7 @@ int main(int argc, char **argv) {
             uint8_t *oy = out.data(), *ou = out.data() + ysz, *ov = ou + csz;
             for (int y = 0; y < H; y++) {
                 for (int x = 0; x < W; x++) {
-                    float P0 = 0.0f, P1 = 0.0f, wsum = 0.0f;
+                    float P0 = 0.0f, P1 = 0.0f, wsum = 0.0f, w0s = 0.0f, w1s = 0.0f;
                     if (opt & 32768) {
                         // OBMC：每个像素用周围 4 个块的矢量各 w 一次，按到块中心的距离加权合并。
                         // 块与块的接缝因此被抹平，运动边缘不再出现方格子。
@@ -389,12 +389,26 @@ int main(int argc, char **argv) {
                                 float bxp = x + v.x * (1 - t), byp = y + v.y * (1 - t);
                                 if (ax < 0 || ay < 0 || ax > W - 1 || ay > H - 1) continue;
                                 if (bxp < 0 || byp < 0 || bxp > W - 1 || byp > H - 1) continue;
+                                // 反向场一致性：这一侧的矢量走回来对不上，说明该点被遮挡或在做
+                                // 非刚性运动，降低 b 侧权重，避免把 b 的错位内容糊进来（重影/果冻）
+                                float trust = 1.0f;
+                                if ((opt & 65536) && gw > 0) {
+                                    Vec2 gg = sample_vec_b(gfield, gw, gh, B, std::min(W - 1, std::max(0, (int)lroundf(x + v.x))), std::min(H - 1, std::max(0, (int)lroundf(y + v.y))));
+                                    float ex = v.x + gg.x, ey = v.y + gg.y;
+                                    float rr = sqrtf(ex * ex + ey * ey);
+                                    trust = 1.0f / (1.0f + rr * rr * 0.25f);
+                                }
                                 P0 += bilin(a, ax, ay) * wk;
-                                P1 += bilin(b, bxp, byp) * wk;
+                                P1 += bilin(b, bxp, byp) * wk * trust;
                                 wsum += wk;
+                                w0s += wk;
+                                w1s += wk * trust;
                             }
                         }
-                        if (wsum > 1e-4f) { P0 /= wsum; P1 /= wsum; } else { wsum = 0.0f; }
+                        if (wsum > 1e-4f) {
+                            P0 /= (w0s > 1e-4f ? w0s : wsum);
+                            P1 /= (w1s > 1e-4f ? w1s : wsum);
+                        } else { wsum = 0.0f; }
                     } else {
                         Vec2 v = (opt & 256) ? sample_vec_b(cur, bw, bh, B, x, y) : sample_vech(cur, bw, bh, B, x, y);
                         float ax = x - v.x * t, ay = y - v.y * t;

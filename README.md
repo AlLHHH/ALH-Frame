@@ -175,7 +175,7 @@ python tools/make_ui_mock.py         # 界面版式预览（需要 Pillow）
 
 ## 许可与第三方
 
-Java 代码 Apache-2.0，见 [LICENSE](LICENSE)。内置的 ffmpeg 是 GPLv3（`--enable-gpl --enable-version3` 加 libx264/libx265），以独立进程方式调用，源码获取方式、完整 configure 行和各外部库许可证见 [docs/THIRD-PARTY.md](docs/THIRD-PARTY.md)。
+Java 代码 Apache-2.0，见 [LICENSE](LICENSE)。内置的 ffmpeg 是 GPLv3（`--enable-gpl --enable-version3` 加 libx264/libx265），以独立进程方式调用，源码可直接下载：[ffmpeg-9.0.2-source.tar.xz](https://github.com/AlLHHH/ALH-Frame/releases/download/v1.0.0/ffmpeg-9.0.2-source.tar.xz)（12 MB，与官方 tarball 字节一致）。重建步骤、完整 configure 行、各外部库许可证见 [docs/BUILD-SOURCE.md](docs/BUILD-SOURCE.md) 和 [docs/THIRD-PARTY.md](docs/THIRD-PARTY.md)。
 
 ## 关键词
 

@@ -15,6 +15,7 @@
 | 许可证 | **GNU GPL v3**（构建时启用了 `--enable-gpl --enable-version3`，并链接了 GPL 的 libx264 / libx265，因此整体为 GPLv3，而非 LGPL） |
 | 许可条文本 | <https://www.gnu.org/licenses/gpl-3.0.txt> |
 | 上游源码 | <https://ffmpeg.org/download.html>（对应 9.0 分支：<https://git.ffmpeg.org/ffmpeg.git>） |
+| 本版本源码包（可直接下载） | [ffmpeg-9.0.2-source.tar.xz](https://github.com/AlLHHH/ALH-Frame/releases/download/v1.0.0/ffmpeg-9.0.2-source.tar.xz) · 12,040,788 B · sha256 `8c3850283eb25fa026482078a04051e0be17347b09ef81a0849bec15a96e002e`（与 ffmpeg.org 官方 tarball 字节一致） |
 | 本二进制的构建配置 | 见下 |
 
 本二进制内置的 `configuration` 行（由 `ffmpeg -version` 输出，是还原构建的唯一依据）：
@@ -29,7 +30,7 @@
 
 ### 合规状态与义务
 
-1. **源码提供**：本仓库不存放 FFmpeg 源码（二进制不入库，源码亦不入库）。分发者需按 GPLv3 第 6 条，向收到 APK 的人提供「对应源码」。可选做法：
+1. **源码提供**：FFmpeg 本体的 9.0.2 源码包已作为发布资产上传，链接见上表，重建步骤见 [BUILD-SOURCE.md](BUILD-SOURCE.md)。外部库按各自上游仓库自取。分发者需按 GPLv3 第 6 条向收到 APK 的人提供「对应源码」。可选做法：
    - 在发布页附上 FFmpeg 官方源码地址 + 上面的 configure 行（若二进制与官方源码一致、未做修改，这是最常见也最省事的做法）；
    - 或提供一份包含 FFmpeg 源码 + 各外部库源码的压缩包/网盘链接；
    - 或提供书面承诺（written offer），有效期三年。

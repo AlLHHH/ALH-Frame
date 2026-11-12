@@ -620,6 +620,9 @@ public class Engine {
                 // 最后兜底：关掉 libx264 的全部 SIMD，绕开某些机型上的 asm 崩溃（慢，但能出片）
                 c.add("-x264-params");
                 c.add("asm=c");
+                // ffmpeg 自身的 SIMD 也关掉：minterpolate 的 C 路径虽慢，但不会再踩到指令集相关问题
+                c.add("-cpuflags");
+                c.add("0");
             }
             c.add(out.getAbsolutePath());
 

@@ -1,0 +1,9 @@
+build/
+*.apk
+*.jks
+*.keystore
+app/assets/ff/ffmpeg
+tools/sdkroot/
+tools/jdk-*/
+*.iml
+.idea/

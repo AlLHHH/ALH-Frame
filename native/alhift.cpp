@@ -305,6 +305,7 @@ int main(int argc, char **argv) {
     FILE *fo = (strcmp(outp, "-") == 0) ? stdout : fopen(outp, "wb");
     if (!fi || !fo) { fprintf(stderr, "open failed\n"); return 3; }
 
+    if (NFR < 2) { fprintf(stderr, "need >=2 frames (got %d)\n", NFR); return 2; }
     vector<uint8_t> fa(fsz), fb(fsz);
     if (fread(fa.data(), 1, fsz, fi) != fsz) { fprintf(stderr, "need >=2 frames\n"); return 3; }
 
@@ -617,6 +618,7 @@ int main(int argc, char **argv) {
         done++;
     }
     fclose(fi); fclose(fo);
+    if (done == 0) { fprintf(stderr, "no frames written\n"); return 4; }
     fprintf(stderr, "wrote %d frames dup=%d\n", done, ndup);
     return 0;
 }

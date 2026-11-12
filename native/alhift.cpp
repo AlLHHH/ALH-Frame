@@ -39,6 +39,27 @@ static void down2(const Img &s, Img &d) {
 struct Vec2 { float x, y; };
 
 // 单层块匹配：以 init 矢量为中心做 ±rad 搜索，块大小 B，返回整像素最优位移
+static float g_pen = 0.25f;   // 每像素每位移的惩罚（ffmpeg 等效值 0.25 灰阶/px）
+static int g_win = 2;         // 窗比块每边外扩像素（B=8 → 12×12 窗；比整块 SAD 稳，又不像 2×mb 那么贵）
+
+// 噪声估计：拉普拉斯响应的 MAD/6 ≈ 高斯噪声 σ（灰阶）
+static float y_sigma(const Img &a) {
+    int w = a.w, h = a.h;
+    if (w < 8 || h < 8) return 1.0f;
+    vector<uint8_t> lap((size_t)(w - 2) * (h - 2));
+    size_t n = 0;
+    for (int y = 1; y < h - 1; y++) {
+        const uint8_t *r0 = a.row(y - 1), *r1 = a.row(y), *r2 = a.row(y + 1);
+        for (int x = 1; x < w - 1; x++) {
+            int v = 4 * (int)r1[x] - (int)r0[x] - (int)r2[x] - (int)r1[x - 1] - (int)r1[x + 1];
+            lap[n++] = (uint8_t)std::min(255, std::abs(v));
+        }
+    }
+    if (n == 0) return 1.0f;
+    std::nth_element(lap.begin(), lap.begin() + n / 2, lap.end());
+    float mad = (float)lap[n / 2];
+    return 1.4826f * mad / 6.0f;
+}
 static void match_level(const Img &a, const Img &b, int B, int rad,
                         const vector<Vec2> &init, vector<Vec2> &out,
                         vector<float> &cost, int &bw, int &bh) {
@@ -62,11 +83,13 @@ static void match_level(const Img &a, const Img &b, int B, int rad,
                         for (int dx = -rx; dx <= rx; dx++) {
                             int sx = cx + dx, sy = cy + dy;
                             if (pass == 1 && dx == 0 && dy == 0) continue;
-                            // 边界：整块必须落在 b 内（边缘块按可用区域算）
-                            int x0 = px, y0_ = py;
-                            int x1 = std::min(px + B, a.w), y1_ = std::min(py + B, a.h);
+                            // 2×B 重叠窗（对外一圈也计入代价，压制内圈因欠纹理而乱跳）
+                            int x0 = std::max(0, px - g_win);
+                            int y0_ = std::max(0, py - g_win);
+                            int x1 = std::min(px + B + g_win, a.w);
+                            int y1_ = std::min(py + B + g_win, a.h);
                             // 源块四角都必须落在 b 内，否则跳过（越界读会崩）
-                            if (px + sx < 0 || py + sy < 0 || x1 + sx > b.w || y1_ + sy > b.h) continue;
+                            if (x0 + sx < 0 || y0_ + sy < 0 || x1 + sx > b.w || y1_ + sy > b.h) continue;
                             long sad = 0;
                             for (int y = y0_; y < y1_; y++) {
                                 const uint8_t *ra = a.row(y) + x0;
@@ -76,8 +99,10 @@ static void match_level(const Img &a, const Img &b, int B, int rad,
                                     sad += d < 0 ? -d : d;
                                 }
                             }
-                            // 轻微惩罚大矢量，抑制纹理重复导致的跳变
-                            float c = (float)sad + 0.02f * (fabsf((float)sx) + fabsf((float)sy));
+                            // 匹配代价惩罚（等效 ffmpeg 的 64×L1 预测惩罚；系数可用 ALH_PEN 覆盖）
+                            long npix = (long)(y1_ - y0_) * (x1 - x0);
+                            int ftop = (fabsf((float)sx) + fabsf((float)sy));
+                            float c = (float)sad / (float)npix + g_pen * (float)ftop;
                             if (c < best) { best = c; bdx = sx; bdy = sy; }
                         }
                     }
@@ -85,7 +110,7 @@ static void match_level(const Img &a, const Img &b, int B, int rad,
                     cx = bdx; cy = bdy;
                 }
                 out[(size_t)by * nx + bx] = Vec2{(float)bdx, (float)bdy};
-                cost[(size_t)by * nx + bx] = best / (float)(B * B);
+                cost[(size_t)by * nx + bx] = best;
             }
         }
     };
@@ -270,6 +295,9 @@ int main(int argc, char **argv) {
     int mult = (argc > 6) ? atoi(argv[6]) : 2;
     int opt = (argc > 7) ? atoi(argv[7]) : 3;
     if (W <= 0 || H <= 0 || NFR <= 0 || mult < 2) return 2;
+    bool penFixed = false;
+    if (const char *e = getenv("ALH_PEN")) { g_pen = (float)atof(e); penFixed = true; }
+    if (const char *e = getenv("ALH_WIN")) g_win = atoi(e);
     size_t ysz = (size_t)W * H, csz = (size_t)(W / 2) * (H / 2);
     size_t fsz = ysz + 2 * csz;
 
@@ -305,6 +333,17 @@ int main(int argc, char **argv) {
         }
         memcpy(a.p.data(), fa.data(), ysz);
         memcpy(b.p.data(), fb.data(), ysz);
+
+        // 首次拿到真实像素后估噪声：干净片贴合 ffmpeg 的 0.25，噪声越大越松
+        // （噪声让 SAD 不可靠，重罚会把矢量场压回零矢量，画面反而糊）
+        if (!penFixed) {
+            float sg = y_sigma(a);
+            g_pen = 0.25f * (1.0f - (sg - 1.2f) / 3.3f);
+            if (g_pen < 0.02f) g_pen = 0.02f;
+            if (g_pen > 0.25f) g_pen = 0.25f;
+            penFixed = true;
+            fprintf(stderr, "sigma=%.2f pen=%.3f\n", sg, g_pen);
+        }
 
         // 去重复帧：前后两帧几乎一致时直接复制，不插值（避免鬼影与假运动）
         if (opt & 4096) {

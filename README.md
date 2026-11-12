@@ -71,3 +71,7 @@ Apache License 2.0，见 [LICENSE](LICENSE)。
 > Copyright 2026 AlLHHH
 
 内置 ffmpeg 为独立项目，遵循其自身许可（GPL/LGPL，取决于构建选项），本项目不分发该二进制。
+## 第三方组件
+
+APK 内置的 FFmpeg 是 **GPLv3**（`--enable-gpl --enable-version3` + libx264/libx265），不属于本仓库 Apache-2.0 范围。源码获取方式、完整 configure 行、各外部库许可证见 [docs/THIRD-PARTY.md](docs/THIRD-PARTY.md)。
+

@@ -105,29 +105,21 @@ public class MainActivity extends Activity {
         root.setFillViewport(true);
         root.setBackgroundColor(C_BG);
         root.addView(buildUi());
-
-        // 条款入口固定在底部，不随内容滚走
-        LinearLayout page = new LinearLayout(this);
-        page.setOrientation(LinearLayout.VERTICAL);
-        page.setBackgroundColor(C_BG);
-        page.addView(root, new LinearLayout.LayoutParams(-1, 0, 1f));
-        page.addView(footer());
-        setContentView(page);
+        setContentView(root);
 
         if (!Terms.agreed(this)) {
             Sheet.terms(this, true);
         }
     }
 
-    /** 底部常驻的条款入口：始终可见、可点开重读。 */
+    /** 页面最底部的条款入口：随内容滚动，不常驻，离操作区远。 */
     private View footer() {
         TextView t = new TextView(this);
-        t.setText(Terms.TITLE);
-        t.setTextSize(11.5f);
+        t.setText("免责声明与使用条款");
+        t.setTextSize(12f);
         t.setTextColor(C_DIM);
         t.setGravity(android.view.Gravity.CENTER);
-        t.setPadding(dp(16), dp(10), dp(16), dp(16));
-        t.setBackgroundColor(C_BG);
+        t.setPadding(dp(12), dp(14), dp(12), dp(14));
         t.setOnClickListener(new View.OnClickListener() {
             public void onClick(View v) {
                 Sheet.terms(MainActivity.this, false);
@@ -302,6 +294,9 @@ public class MainActivity extends Activity {
         boxProgress.addView(btnCancel, lp(-1, dp(44), 0, dp(14), 0, 0));
 
         col.addView(boxProgress, lp(-1, -2, 0, 0, 0, 0));
+
+        // 条款入口放在内容最末：要滑到底才碰到，不会误触
+        col.addView(footer(), lp(-1, -2, 0, dp(30), 0, 0));
         return col;
     }
 

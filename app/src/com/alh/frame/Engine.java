@@ -286,11 +286,11 @@ public class Engine {
 
         // 每个 worker 的峰值内存估计（MB）：1080p ≈ 789MB
         double mp = (double) ii.w * ii.h / 1000000.0;
-        double perWorkerMb = 250 + 260 * mp;
+        double perWorkerMb = Math.max(384, 250 + 260 * mp);
         long mem = memAvailableMb();
         int workers = cap;
         if (mem > 0) {
-            int fit = (int) Math.max(1, (long) (mem * 0.45 / perWorkerMb));
+            int fit = (int) Math.max(1, (long) (mem * 0.35 / perWorkerMb));
             workers = Math.min(cap, fit);
         }
         workers = Math.max(1, workers);
@@ -372,13 +372,16 @@ public class Engine {
                         File out = new File(tmpF,
                                 "c" + String.format(Locale.US, "%03d", Integer.valueOf(i)) + ".ts");
                         Worker wk = new Worker(ffF, srcF, out, s0, s1, inFpsF, outFpsF, n,
-                                mult, errors, totalF, tStart);
+                                mult, errors, totalF, tStart, ii.w, ii.h);
                         wk.run();
-                        if (!wk.ok()) {
-                            // 并发过高时 ffmpeg 会被系统直接杀掉，单独串行再跑一次
+                        // 并发过高时 ffmpeg 会被系统直接杀掉（139/137）：两次降级重跑，一次比一次保守
+                        for (int att = 1; att <= 2 && !wk.ok(); att++) {
                             String old = wk.failure;
                             wk.failure = null;
-                            note("job", "第 " + (i + 1) + " 段失败，串行重跑（" + (old == null ? "?" : old) + "）");
+                            wk.attempt = att;
+                            note("job", "第 " + (i + 1) + " 段失败，第 " + att + " 次降级重跑（"
+                                    + (old == null ? "?" : old) + "）· "
+                                    + (att == 1 ? "单线程" : "单线程 + x264 纯 C"));
                             wk.run();
                             if (old != null) {
                                 errors.remove(old);
@@ -509,11 +512,14 @@ public class Engine {
         final double srcFps;
         final double outFps;
         final int frames;      // 本段应产出帧数（= round(tEnd*outFps) - round(tStart*outFps)）
+        final int vw, vh;      // 源宽高（用于 16 对齐补边）
         final int mult;
         final List<String> errors;
         final int total;
         final long t0;
         int localFrames;
+        /** 本段第几次尝试：0 正常，1 单线程，2 单线程 + x264 纯 C。 */
+        volatile int attempt;
         /** 本段失败原因；重跑成功会清空，所以只反映最后一次尝试的结果。 */
         volatile String failure;
 
@@ -522,7 +528,8 @@ public class Engine {
         }
 
         Worker(String ff, File src, File out, double tStart, double tEnd, double srcFps,
-               double outFps, int frames, int mult, List<String> errors, int total, long t0) {
+               double outFps, int frames, int mult, List<String> errors, int total, long t0,
+               int vw, int vh) {
             this.ff = ff;
             this.src = src;
             this.out = out;
@@ -535,6 +542,8 @@ public class Engine {
             this.errors = errors;
             this.total = total;
             this.t0 = t0;
+            this.vw = vw;
+            this.vh = vh;
         }
 
         void report(int done) {
@@ -549,10 +558,22 @@ public class Engine {
             // 不再「丢掉开头 mult 帧」——那是把一个源帧的时长白扔了，段与段之间会缺帧、总时长变短。
             String ss = fmt(tStart);
             String dur = fmt((tEnd - tStart) + 2.0 / srcFps);
-            StringBuilder vf = new StringBuilder("tpad=stop_mode=clone:stop_duration=");
+            StringBuilder vf = new StringBuilder();
+            // minterpolate 按 16×16 块做运动估计，宽高不是 16 的整数倍时边缘会越界读，
+            // 部分机型直接 SIGSEGV（退出码 139）。补边到 16 的倍数，算完再裁回原尺寸。
+            int pw = (vw + 15) / 16 * 16;
+            int ph = (vh + 15) / 16 * 16;
+            boolean padded = pw != vw || ph != vh;
+            if (padded) {
+                vf.append("pad=").append(pw).append(':').append(ph).append(":0:0,");
+            }
+            vf.append("tpad=stop_mode=clone:stop_duration=");
             vf.append(fmt(3.0 / srcFps)).append(',');
             vf.append("minterpolate=fps=").append(fmt(outFps)).append(MCI_TAIL);
             vf.append(",trim=end_frame=").append(frames);
+            if (padded) {
+                vf.append(",crop=").append(vw).append(':').append(vh).append(":0:0");
+            }
             // 时间戳直接落到全局帧位：段与段按字节拼接后时间轴天然连续
             vf.append(",setpts=PTS-STARTPTS+").append(Math.round(tStart * outFps))
               .append("/(").append(fmt(outFps)).append("*TB)");
@@ -575,8 +596,9 @@ public class Engine {
             c.add("libx264");
             c.add("-preset");
             c.add("veryfast");
+            // 重跑时降到单线程：设备上 ffmpeg 139（SIGSEGV）多半和并发线程抢内存有关
             c.add("-threads");
-            c.add("2");
+            c.add(attempt == 0 ? "2" : "1");
             c.add("-crf");
             c.add("19");
             c.add("-pix_fmt");
@@ -594,6 +616,11 @@ public class Engine {
             // 无 B 帧：有 B 帧时 TS 会把首帧时间戳按重排延迟抬起，段与段就会错位一帧
             c.add("-bf");
             c.add("0");
+            if (attempt >= 2) {
+                // 最后兜底：关掉 libx264 的全部 SIMD，绕开某些机型上的 asm 崩溃（慢，但能出片）
+                c.add("-x264-params");
+                c.add("asm=c");
+            }
             c.add(out.getAbsolutePath());
 
             note("cmd", out.getName() + " (" + fmt(tStart) + "s–" + fmt(tEnd) + "s, 输出 "
@@ -612,7 +639,7 @@ public class Engine {
                                     new InputStreamReader(fp.getErrorStream()), 8192);
                             String l;
                             while ((l = br.readLine()) != null) {
-                                if (err.length() < 3000) {
+                                if (err.length() < (attempt >= 1 ? 8000 : 3000)) {
                                     err.append(l).append('\n');
                                 }
                             }

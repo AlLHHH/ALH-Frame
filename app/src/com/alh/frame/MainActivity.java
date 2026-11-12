@@ -665,6 +665,16 @@ public class MainActivity extends Activity {
     }
 
     @Override
+    protected void onDestroy() {
+        // 用户按返回键离开时引擎线程还在跑：不停掉的话前台通知会一直挂着，再没人收尾。
+        if (engine != null && running) {
+            engine.cancel();
+        }
+        Keep.stop(this);
+        super.onDestroy();
+    }
+
+    @Override
     public void onRequestPermissionsResult(int code, String[] perms, int[] res) {
         super.onRequestPermissionsResult(code, perms, res);
         if (code == 2) {

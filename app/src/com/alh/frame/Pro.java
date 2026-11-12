@@ -17,7 +17,8 @@ import java.io.ByteArrayOutputStream;
  */
 final class Pro {
 
-    static final String VER = "alhift-1";
+    // 内核二进制换了就必须改这里，否则老装机上会继续用 files/bin 里的旧内核。
+    static final String VER = "alhift-2";
 
     private static String cached;
 

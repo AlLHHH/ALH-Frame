@@ -221,6 +221,43 @@ static void refine_sub(const Img &a, const Img &b, vector<Vec2> &v, int B, int b
     for (auto &t : th) t.join();
 }
 
+// Gauss-Newton 亚像素迭代：在 a(x) ≈ b(x+v) 上做两轮最小二乘，比抛物线插值准得多
+static void refine_lk(const Img &a, const Img &b, vector<Vec2> &v, int B, int bw, int bh, int iters) {
+    const int nthreads = std::max(1u, std::thread::hardware_concurrency());
+    auto work = [&](int y0, int y1) {
+        for (int by = y0; by < y1; by++) {
+            for (int bx = 0; bx < bw; bx++) {
+                int px = bx * B, py = by * B;
+                Vec2 t = v[(size_t)by * bw + bx];
+                for (int it = 0; it < iters; it++) {
+                    double num_x = 0, num_y = 0, den = 0;
+                    for (int y = py; y < std::min(py + B, a.h); y++) {
+                        const uint8_t *ra = a.row(y);
+                        for (int x = px; x < std::min(px + B, a.w); x++) {
+                            float bx0 = bilin(b, x + t.x, y + t.y);
+                            float gx = (bilin(b, x + t.x + 1, y + t.y) - bilin(b, x + t.x - 1, y + t.y)) * 0.5f;
+                            float gy = (bilin(b, x + t.x, y + t.y + 1) - bilin(b, x + t.x, y + t.y - 1)) * 0.5f;
+                            double r = (double)ra[x] - bx0;
+                            num_x += gx * r; num_y += gy * r; den += (double)gx * gx + (double)gy * gy;
+                        }
+                    }
+                    if (den < 1e-3) break;
+                    float dx = (float)(num_x / den), dy = (float)(num_y / den);
+                    dx = std::max(-1.0f, std::min(1.0f, dx));
+                    dy = std::max(-1.0f, std::min(1.0f, dy));
+                    t.x += dx; t.y += dy;
+                    if (fabsf(dx) < 0.02f && fabsf(dy) < 0.02f) break;
+                }
+                v[(size_t)by * bw + bx] = t;
+            }
+        }
+    };
+    vector<std::thread> th;
+    int step = std::max(1, bh / nthreads);
+    for (int y = 0; y < bh; y += step) th.emplace_back(work, y, std::min(bh, y + step));
+    for (auto &t : th) t.join();
+}
+
 int main(int argc, char **argv) {
     if (argc < 6) {
         fprintf(stderr, "usage: alhift in.yuv W H N out.yuv [mult]\n");
@@ -284,6 +321,22 @@ int main(int argc, char **argv) {
             }
         }
 
+        // 场景切换：两帧几乎无相关性时任何插值都只会糊出鬼影，直接复制当前帧
+        if (opt & 262144) {
+            long dsum = 0; int cnt = 0;
+            for (int y = 0; y < H; y += 4) {
+                const uint8_t *ra = fa.data() + (size_t)y * W, *rb = fb.data() + (size_t)y * W;
+                for (int x = 0; x < W; x += 4) { dsum += std::abs((int)ra[x] - (int)rb[x]); cnt++; }
+            }
+            if (cnt > 0 && (float)dsum / cnt > 26.0f) {
+                for (int q = 0; q < mult; q++) fwrite(fa.data(), 1, fsz, fo);
+                done += mult;
+                fprintf(stderr, "k=%d scd\n", k);
+                fa.swap(fb);
+                continue;
+            }
+        }
+
         fprintf(stderr, "k=%d pyr\n", k);
         // 金字塔
         pa[0] = a; pb[0] = b;
@@ -295,7 +348,7 @@ int main(int argc, char **argv) {
             for (int l = LEVELS - 1; l >= 0; l--) {
                 int Bb = 8;
                 int rad = (l == LEVELS - 1) ? 8 : 2;
-                if (l == 0) rad = 3;
+                if (l == 0) rad = (opt & 134217728) ? 16 : ((opt & 67108864) ? 12 : ((opt & 33554432) ? 8 : ((opt & 32) ? 6 : 3)));
                 int tw = (A[l].w + Bb - 1) / Bb, th = (A[l].h + Bb - 1) / Bb;
                 vector<Vec2> init;
                 if (c2.empty()) init.assign((size_t)tw * th, Vec2{0, 0});
@@ -327,6 +380,7 @@ int main(int argc, char **argv) {
         median3(cur, bw, bh);
         if (opt & 16) { median3(cur, bw, bh); median3(cur, bw, bh); }   // 多遍中值：压块状拼布
         if (opt & 1) refine_sub(pa[0], pb[0], cur, B, bw, bh);
+        if (opt & 524288) refine_lk(pa[0], pb[0], cur, B, bw, bh, 3);
         if (opt & 1) median3(cur, bw, bh);
         // 时间一致性：与上一对帧的矢量场轻微融合，压掉逐帧跳变
         static vector<Vec2> prevV;
@@ -419,10 +473,38 @@ int main(int argc, char **argv) {
                         else if (i0) { P0 = bilin(a, ax, ay); P1 = P0; wsum = 1.0f; }
                         else if (i1) { P1 = bilin(b, bxp, byp); P0 = P1; wsum = 1.0f; }
                     }
+                    // 反向场当第二组候选：F 与 G 对同一中间点给出两个版本，
+                    // 取 warp 残差小的那个，单向遮挡处就不会被糊成双影
+                    if ((opt & 131072) && gw > 0 && wsum > 1e-4f && fabsf(P0 - P1) > 12.0f) {
+                        Vec2 gg = sample_vec_b(gfield, gw, gh, B, x, y);
+                        float ax2 = x + gg.x * t, ay2 = y + gg.y * t;
+                        float bx2 = x - gg.x * (1 - t), by2 = y - gg.y * (1 - t);
+                        if (ax2 >= 0 && ay2 >= 0 && ax2 <= W - 1 && ay2 <= H - 1 &&
+                            bx2 >= 0 && by2 >= 0 && bx2 <= W - 1 && by2 <= H - 1) {
+                            float q0 = bilin(a, ax2, ay2), q1 = bilin(b, bx2, by2);
+                            float d1 = fabsf(P0 - P1), d2 = fabsf(q0 - q1);
+                            if (d2 < d1) { P0 = q0; P1 = q1; }
+                        }
+                    }
                     float tm = bilin(a, (float)x, (float)y) * (1 - t) + bilin(b, (float)x, (float)y) * t;
                     float val;
                     if (wsum <= 1e-4f) {
                         val = tm;
+                    } else if (opt & 2097152) {
+                        // Super SloMo 式可见性加权：两侧各自的置信度必须分开保留，
+                        // 否则归一化会把置信度整体约掉（老 bug）。V0/V1 用「warp 回原位置是否还对得上」来量。
+                        float vx = 0, vy = 0, e0 = 0, e1 = 0;
+                        {
+                            Vec2 vv = sample_vec_b(cur, bw, bh, B, x, y);
+                            vx = vv.x; vy = vv.y;
+                            float axx = x - vx * t, ayy = y - vy * t;
+                            float bxx = x + vx * (1 - t), byy = y + vy * (1 - t);
+                            e0 = fabsf(bilin(a, axx, ayy) - bilin(b, axx + vx, ayy + vy));
+                            e1 = fabsf(bilin(b, bxx, byy) - bilin(a, bxx - vx, byy - vy));
+                        }
+                        float V0 = expf(-e0 * e0 / SIG2), V1 = expf(-e1 * e1 / SIG2);
+                        float a0 = (1 - t) * V0, a1 = t * V1, Z = a0 + a1;
+                        val = (Z < 0.05f) ? tm : (P0 * a0 + P1 * a1) / Z;
                     } else {
                         float mx = P0 * (1 - t) + P1 * t;
                         if (opt & 16384) {

@@ -140,7 +140,7 @@ public class MainActivity extends Activity {
     private LinearLayout buildUi() {
         LinearLayout col = new LinearLayout(this);
         col.setOrientation(LinearLayout.VERTICAL);
-        col.setPadding(dp(20), dp(24), dp(20), dp(30));
+        col.setPadding(dp(20), dp(24), dp(20), dp(40));
 
         LinearLayout head = new LinearLayout(this);
         head.setOrientation(LinearLayout.HORIZONTAL);
@@ -313,7 +313,7 @@ public class MainActivity extends Activity {
                 start();
             }
         });
-        col.addView(btnStart, lp(-1, dp(52), 0, 0, 0, dp(20)));
+        col.addView(btnStart, lp(-1, dp(52), 0, dp(12), 0, dp(20)));
 
         // 进度区只在真正开跑后出现，避免空文本把下方挤成一团。
         boxProgress = new LinearLayout(this);
@@ -476,8 +476,8 @@ public class MainActivity extends Activity {
         }
         if (tvEngineNote != null) {
             tvEngineNote.setText(e == 1
-                    ? "自研内核（实验）：低分辨率更快，复杂实拍画面仍可能出现块状伪影。"
-                    : "基于 ffmpeg minterpolate：高分辨率、复杂运动更稳，推荐日常使用。");
+                    ? "自研内核（实验）：低分辨率更快，复杂实拍可能有块状伪影。"
+                    : "基于 ffmpeg minterpolate：复杂运动更稳，推荐日常使用。");
         }
         if (btnDedup != null) {
             // 去重复帧是自研内核的开关，Lite 上不显示，免得看成对 ffmpeg 也能用

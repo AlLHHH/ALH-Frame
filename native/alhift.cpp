@@ -361,93 +361,114 @@ int main(int argc, char **argv) {
         // 输出：原始帧 + 插值帧（mult-1 张）
         fwrite(fa.data(), 1, fsz, fo);
         done++;
+        const int hw = W / 2, hh = H / 2;
+        const float SIG2 = 2.0f * 40.0f * 40.0f;
         for (int s = 1; s < mult; s++) {
             float t = (float)s / (float)mult;
             vector<uint8_t> out(fsz);
             uint8_t *oy = out.data(), *ou = out.data() + ysz, *ov = ou + csz;
             for (int y = 0; y < H; y++) {
                 for (int x = 0; x < W; x++) {
-                    Vec2 v = (opt & 256) ? sample_vec_b(cur, bw, bh, B, x, y) : sample_vech(cur, bw, bh, B, x, y);
-                    float c = conf[(size_t)(y / B) * bw + (x / B)];
-                    if (opt & 4) c = 1.0f;
-                    // 多假设：取像素四周 4 个块的矢量作候选，按双向一致性 WTA 选一个（OBMC 式）
-                    if (opt & 512) {
-                        int bx0 = x / B, by0 = y / B;
-                        int oxs[4] = {bx0 - 1, bx0, bx0 - 1, bx0};
-                        int oys[4] = {by0 - 1, by0 - 1, by0, by0};
-                        float best = 1e9f, bp0 = 0, bp1 = 0;
-                        Vec2 bv = v;
-                        for (int k = 0; k < 4; k++) {
-                            int cx = std::min(bw - 1, std::max(0, oxs[k]));
-                            int cy = std::min(bh - 1, std::max(0, oys[k]));
-                            Vec2 cd = cur[(size_t)cy * bw + cx];
-                            float xx0 = x - cd.x * t, yy0 = y - cd.y * t;
-                            float xx1 = x + cd.x * (1 - t), yy1 = y + cd.y * (1 - t);
-                            if (xx0 < 0 || yy0 < 0 || xx0 > W - 1 || yy0 > H - 1) continue;
-                            if (xx1 < 0 || yy1 < 0 || xx1 > W - 1 || yy1 > H - 1) continue;
-                            float q0 = bilin(a, xx0, yy0), q1 = bilin(b, xx1, yy1);
-                            float d = fabsf(q0 - q1);
-                            if (d < best) { best = d; bp0 = q0; bp1 = q1; bv = cd; }
+                    float P0 = 0.0f, P1 = 0.0f, wsum = 0.0f;
+                    if (opt & 32768) {
+                        // OBMC：每个像素用周围 4 个块的矢量各 w 一次，按到块中心的距离加权合并。
+                        // 块与块的接缝因此被抹平，运动边缘不再出现方格子。
+                        int bx0 = std::min(bw - 1, x / B), by0 = std::min(bh - 1, y / B);
+                        int sgnx = (x >= bx0 * B + B / 2) ? 1 : -1;
+                        int sgny = (y >= by0 * B + B / 2) ? 1 : -1;
+                        int cxb[2] = {bx0, bx0 + sgnx}, cyb[2] = {by0, by0 + sgny};
+                        for (int j = 0; j < 2; j++) {
+                            for (int i = 0; i < 2; i++) {
+                                int cx = std::min(bw - 1, std::max(0, cxb[i]));
+                                int cy = std::min(bh - 1, std::max(0, cyb[j]));
+                                float ccx = cx * B + B * 0.5f, ccy = cy * B + B * 0.5f;
+                                float wk = (1.0f - fabsf((float)x - ccx) / B) * (1.0f - fabsf((float)y - ccy) / B);
+                                if (wk <= 0.02f) continue;
+                                Vec2 v = cur[(size_t)cy * bw + cx];
+                                float ax = x - v.x * t, ay = y - v.y * t;
+                                float bxp = x + v.x * (1 - t), byp = y + v.y * (1 - t);
+                                if (ax < 0 || ay < 0 || ax > W - 1 || ay > H - 1) continue;
+                                if (bxp < 0 || byp < 0 || bxp > W - 1 || byp > H - 1) continue;
+                                P0 += bilin(a, ax, ay) * wk;
+                                P1 += bilin(b, bxp, byp) * wk;
+                                wsum += wk;
+                            }
                         }
-                        if (best < 1e8f) {
-                            float w0 = (1 - t) * (0.35f + 0.65f * c), w1 = t * (0.35f + 0.65f * c);
-                            float val = (bp0 * w0 + bp1 * w1) / (w0 + w1);
-                            oy[(size_t)y * W + x] = (uint8_t)std::max(0, std::min(255, (int)lroundf(val)));
-                            continue;
-                        }
+                        if (wsum > 1e-4f) { P0 /= wsum; P1 /= wsum; } else { wsum = 0.0f; }
+                    } else {
+                        Vec2 v = (opt & 256) ? sample_vec_b(cur, bw, bh, B, x, y) : sample_vech(cur, bw, bh, B, x, y);
+                        float ax = x - v.x * t, ay = y - v.y * t;
+                        float bxp = x + v.x * (1 - t), byp = y + v.y * (1 - t);
+                        bool i0 = ax >= 0 && ay >= 0 && ax <= W - 1 && ay <= H - 1;
+                        bool i1 = bxp >= 0 && byp >= 0 && bxp <= W - 1 && byp <= H - 1;
+                        if (i0 && i1) { P0 = bilin(a, ax, ay); P1 = bilin(b, bxp, byp); wsum = 1.0f; }
+                        else if (i0) { P0 = bilin(a, ax, ay); P1 = P0; wsum = 1.0f; }
+                        else if (i1) { P1 = bilin(b, bxp, byp); P0 = P1; wsum = 1.0f; }
                     }
-                    float x0 = x - v.x * t, y0 = y - v.y * t;
-                    float x1 = x + v.x * (1 - t), y1 = y + v.y * (1 - t);
-                    bool in0 = x0 >= 0 && y0 >= 0 && x0 <= W - 1 && y0 <= H - 1;
-                    bool in1 = x1 >= 0 && y1 >= 0 && x1 <= W - 1 && y1 <= H - 1;
-                    float p0 = in0 ? bilin(a, x0, y0) : 0, p1 = in1 ? bilin(b, x1, y1) : 0;
                     float tm = bilin(a, (float)x, (float)y) * (1 - t) + bilin(b, (float)x, (float)y) * t;
                     float val;
-                    if (!in0 && !in1) {
+                    if (wsum <= 1e-4f) {
                         val = tm;
                     } else {
-                        // 双向一致性：从 a 走到 b 得到 v，再用 b 侧的反向场走回来，长度应互相抵消。
-                        // 对不上说明这一点在中间帧被遮挡或矢量已经错了，此时错位平均就是重影/果冻，
-                        // 按误差大小逐步退回时间插值，宁可略糊也不要果冻。
-                        float ok = 1.0f;
-                        // 只有「两侧 warp 后还对不上」才算真遮挡；对得上就保持锐利，别乱退化成糊
-                        if ((opt & 2048) && gw > 0 && in0 && in1 && fabsf(p0 - p1) > 20.0f) {
-                            Vec2 g = sample_vec_b(gfield, gw, gh, B, x + v.x, y + v.y);
-                            float ex = v.x + g.x, ey = v.y + g.y;
-                            float r = sqrtf(ex * ex + ey * ey);
-                            ok = 1.0f - (r - 0.75f) / 2.25f;
-                            if (ok < 0) ok = 0;
-                            if (ok > 1) ok = 1;
+                        float mx = P0 * (1 - t) + P1 * t;
+                        if (opt & 16384) {
+                            // 两侧 warp 的差就是「这一点到底能不能信矢量」的度量。
+                            // 差得越大越可能是遮挡或错矢量，连续地退回同时刻平均（不硬切换，才不闪）。
+                            float d = fabsf(P0 - P1);
+                            float cpx = expf(-(d * d) / SIG2);
+                            if (cpx < 0.0f) cpx = 0.0f;
+                            val = mx * cpx + tm * (1 - cpx);
+                        } else {
+                            val = mx;
                         }
-                        float w0 = in0 ? (1 - t) : 0;
-                        float w1 = in1 ? t : 0;
-                        float warped = (w0 + w1 < 1e-4f) ? tm : (p0 * w0 + p1 * w1) / (w0 + w1);
-                        val = warped * ok + tm * (1 - ok);
                     }
                     oy[(size_t)y * W + x] = (uint8_t)std::max(0, std::min(255, (int)lroundf(val)));
                 }
             }
-            // 色度：按 8x8 块矢量直接搬
-            for (int y = 0; y < H / 2; y++) {
-                for (int x = 0; x < W / 2; x++) {
-                    Vec2 v = (opt & 256) ? sample_vec_b(cur, bw, bh, B, x * 2, y * 2) : sample_vech(cur, bw, bh, B, x * 2, y * 2);
-                    float x0 = x - v.x * t * 0.5f, y0 = y - v.y * t * 0.5f;
-                    float x1 = x + v.x * (1 - t) * 0.5f, y1 = y + v.y * (1 - t) * 0.5f;
+            // 色度：同样按矢量场 warp（U/V 两个平面一起算）
+            for (int y = 0; y < hh; y++) {
+                for (int x = 0; x < hw; x++) {
                     const uint8_t *au = fa.data() + ysz, *av = au + csz;
                     const uint8_t *bu = fb.data() + ysz, *bv = bu + csz;
-                    int hw = W / 2, hh = H / 2;
                     auto smp = [&](const uint8_t *pl, float sx, float sy) -> float {
                         sx = std::max(0.0f, std::min((float)hw - 1.001f, sx));
                         sy = std::max(0.0f, std::min((float)hh - 1.001f, sy));
                         int ix = (int)floorf(sx), iy = (int)floorf(sy);
                         int jx = std::min(hw - 1, ix + 1), jy = std::min(hh - 1, iy + 1);
                         float fx = sx - ix, fy = sy - iy;
-                        float p = pl[(size_t)iy * hw + ix] * (1 - fx) + pl[(size_t)iy * hw + jx] * fx;
-                        float q = pl[(size_t)jy * hw + ix] * (1 - fx) + pl[(size_t)jy * hw + jx] * fx;
-                        return p * (1 - fy) + q * fy;
+                        float r0 = pl[(size_t)iy * hw + ix] * (1 - fx) + pl[(size_t)iy * hw + jx] * fx;
+                        float r1 = pl[(size_t)jy * hw + ix] * (1 - fx) + pl[(size_t)jy * hw + jx] * fx;
+                        return r0 * (1 - fy) + r1 * fy;
                     };
-                    ou[(size_t)y * hw + x] = (uint8_t)std::max(0, std::min(255, (int)lroundf(smp(au, x0, y0) * (1 - t) + smp(bu, x1, y1) * t)));
-                    ov[(size_t)y * hw + x] = (uint8_t)std::max(0, std::min(255, (int)lroundf(smp(av, x0, y0) * (1 - t) + smp(bv, x1, y1) * t)));
+                    float u0 = 0, u1 = 0, v0 = 0, v1 = 0, ws = 0;
+                    auto addTap = [&](Vec2 v, float wk) {
+                        float sx = x - v.x * t * 0.5f, sy = y - v.y * t * 0.5f;
+                        float sx2 = x + v.x * (1 - t) * 0.5f, sy2 = y + v.y * (1 - t) * 0.5f;
+                        u0 += smp(au, sx, sy) * wk; v0 += smp(av, sx, sy) * wk;
+                        u1 += smp(bu, sx2, sy2) * wk; v1 += smp(bv, sx2, sy2) * wk;
+                        ws += wk;
+                    };
+                    if (opt & 32768) {
+                        int bx0 = std::min(bw - 1, (x * 2) / B), by0 = std::min(bh - 1, (y * 2) / B);
+                        int sgnx = (x * 2 >= bx0 * B + B / 2) ? 1 : -1;
+                        int sgny = (y * 2 >= by0 * B + B / 2) ? 1 : -1;
+                        for (int j = 0; j < 2; j++) {
+                            for (int i = 0; i < 2; i++) {
+                                int cx = std::min(bw - 1, std::max(0, bx0 + (i ? sgnx : 0)));
+                                int cy = std::min(bh - 1, std::max(0, by0 + (j ? sgny : 0)));
+                                float ccx = (cx * B + B * 0.5f) * 0.5f, ccy = (cy * B + B * 0.5f) * 0.5f;
+                                float wk = (1.0f - fabsf((float)x - ccx) / (B * 0.5f)) * (1.0f - fabsf((float)y - ccy) / (B * 0.5f));
+                                if (wk <= 0.02f) continue;
+                                addTap(cur[(size_t)cy * bw + cx], wk);
+                            }
+                        }
+                        if (ws > 1e-4f) { u0 /= ws; u1 /= ws; v0 /= ws; v1 /= ws; }
+                    } else {
+                        Vec2 v = (opt & 256) ? sample_vec_b(cur, bw, bh, B, x * 2, y * 2) : sample_vech(cur, bw, bh, B, x * 2, y * 2);
+                        addTap(v, 1.0f);
+                    }
+                    ou[(size_t)y * hw + x] = (uint8_t)std::max(0, std::min(255, (int)lroundf(u0 * (1 - t) + u1 * t)));
+                    ov[(size_t)y * hw + x] = (uint8_t)std::max(0, std::min(255, (int)lroundf(v0 * (1 - t) + v1 * t)));
                 }
             }
             fwrite(out.data(), 1, fsz, fo);

@@ -805,7 +805,7 @@ public class Engine {
          */
         void runPro(String ss, double want) {
             int nfr = Math.max(2, (int) Math.round(want * srcFps));
-            final int opt = 4 | (dedup ? 4096 : 0);
+            final int opt = 49413 | (dedup ? 4096 : 0);
             int f0 = (int) Math.round(tStart * outFps);
             String vf = "trim=end_frame=" + frames
                     + ",setpts=N/(" + fmt(outFps) + "*TB)+" + f0 + "/(" + fmt(outFps) + "*TB)";

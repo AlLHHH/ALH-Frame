@@ -476,10 +476,12 @@ public class MainActivity extends Activity {
         }
         if (tvEngineNote != null) {
             tvEngineNote.setText(e == 1
-                    ? "自研运动估计内核：低分辨率更清晰，速度快约一倍，边缘伪影更少。"
-                    : "ffmpeg 运动补偿插帧：兼容性最好，高分辨率下更稳。");
+                    ? "自研内核（实验）：低分辨率更快，复杂实拍画面仍可能出现块状伪影。"
+                    : "基于 ffmpeg minterpolate：高分辨率、复杂运动更稳，推荐日常使用。");
         }
         if (btnDedup != null) {
+            // 去重复帧是自研内核的开关，Lite 上不显示，免得看成对 ffmpeg 也能用
+            btnDedup.setVisibility(e == 1 ? View.VISIBLE : View.GONE);
             btnDedup.setEnabled(e == 1);
             btnDedup.setTextColor(e == 1 ? (dedup ? -1 : C_TEXT) : C_DIM);
             btnDedup.setBackground(round(e == 1 && dedup ? C_ACC : C_OFF, dp(12)));

@@ -67,19 +67,19 @@ public class Engine {
     static String stageName(int attempt) {
         switch (attempt) {
             case 1:
-                return "单线程";
+                return "兼容模式 1";
             case 2:
-                return "单线程 + x264 纯 C";
+                return "兼容模式 2";
             case 3:
-                return "换 obmc/bidir 预测 + 关可变块";
+                return "兼容模式 3";
             case 4:
-                return "小块 8×8 + 小搜索半径";
+                return "兼容模式 4";
             case 5:
-                return "关闭运动估计，改帧混合";
+                return "兼容模式 5";
             case 6:
-                return "关闭 minterpolate，纯复制插帧";
+                return "兼容模式 6";
             default:
-                return "原始参数";
+                return "正常模式";
         }
     }
 
@@ -290,7 +290,7 @@ public class Engine {
                         note("error", "cause: " + shortErr(t.getCause()));
                     }
                     saveLastError(msg);
-                    cb.fail(msg, detail(msg));
+                    cb.fail(plain(msg), detail(msg));
                 }
             }
         }, "alhframe").start();
@@ -326,13 +326,14 @@ public class Engine {
         }
         cap = Math.min(cap, Math.max(1, totalOut / 24));
 
-        // 每个 worker 的峰值内存估计（MB）：1080p ≈ 789MB
+        // 每路峰值内存（MB）按实测校过：1080×1620 单路实测 762 MB，
+        // 其中约 200 MB 是固定开销，余下跟像素量走。乘 0.6 把余量留给系统。
         double mp = (double) ii.w * ii.h / 1000000.0;
-        double perWorkerMb = Math.max(384, 250 + 260 * mp);
+        double perWorkerMb = Math.max(360, 200 + 220 * mp);
         long mem = memAvailableMb();
         int workers = cap;
         if (mem > 0) {
-            int fit = (int) Math.max(1, (long) (mem * 0.35 / perWorkerMb));
+            int fit = (int) Math.max(1, (long) (mem * 0.6 / perWorkerMb));
             workers = Math.min(cap, fit);
         }
         workers = Math.max(1, workers);
@@ -381,7 +382,7 @@ public class Engine {
                 + " 帧 · 分段 " + segments + " · 并发 " + workers
                 + " · 单路预算 " + (int) perWorkerMb + " MB · 可用 " + mem + " MB");
         note("job", "编码参数 " + MCI_TAIL);
-        cb.progress("正在准备 · 启动 " + segments + " 路并行", -1, totalOut, -1);
+        cb.progress("正在准备 · 开始编码", -1, totalOut, -1);
 
         final List<String> errors = Collections.synchronizedList(new ArrayList<String>());
         final List<Worker> workersList = Collections.synchronizedList(new ArrayList<Worker>());
@@ -596,7 +597,7 @@ public class Engine {
             int t = totalOut;
             long ms = System.currentTimeMillis() - t0;
             long eta = done > 0 ? (long) ((double) ms * (t - done) / done) : -1;
-            cb.progress(attempt == 0 ? "正在补帧" : "正在补帧 · " + stageName(attempt),
+            cb.progress("正在补帧",
                     Math.min(done, t), t, eta);
         }
 
@@ -1027,6 +1028,18 @@ public class Engine {
             s = s.substring(s.length() - 300);
         }
         return "ffmpeg " + rc + (s.isEmpty() ? "" : "\n" + s);
+    }
+
+    /** 对用户只说白话；带退出码的原文留在 detail 里供复制。 */
+    static String plain(String msg) {
+        if (msg == null) {
+            return "处理失败，请重试";
+        }
+        if (msg.indexOf("139") >= 0 || msg.indexOf("137") >= 0 || msg.indexOf("分段编码") >= 0) {
+            return "编码进程中途退出，已自动尝试兼容模式，仍未成功。可试试降一个倍率。";
+        }
+        return msg.startsWith("处理") ? msg
+                : "处理失败，可重试，或点右上角日志把详情发给我";
     }
 
     public static String shortErr(Throwable t) {

@@ -132,13 +132,23 @@ static void median3(vector<Vec2> &v, int bw, int bh) {
     v.swap(o);
 }
 
-static inline Vec2 sample_vec(const vector<Vec2> &v, int bw, int bh, int B, int x, int y) {
+// 双线性采样矢量场（OBMC 式平滑：块中心之间插值，消除块状接缝）
+static void blur3(Img &a) {
+    Img t = a;
+    for (int y = 1; y + 1 < a.h; y++) {
+        const uint8_t *r0 = t.row(y - 1), *r1 = t.row(y), *r2 = t.row(y + 1);
+        uint8_t *d = a.row(y);
+        for (int x = 1; x + 1 < a.w; x++)
+            d[x] = (uint8_t)((r0[x - 1] + 2 * r0[x] + r0[x + 1] + 2 * r1[x - 1] + 4 * r1[x] + 2 * r1[x + 1] + r2[x - 1] + 2 * r2[x] + r2[x + 1] + 8) >> 4);
+    }
+}
+
+static inline Vec2 sample_vech(const vector<Vec2> &v, int bw, int bh, int B, int x, int y) {
     int bx = std::min(bw - 1, std::max(0, x / B));
     int by = std::min(bh - 1, std::max(0, y / B));
     return v[(size_t)by * bw + bx];
 }
 
-// 双线性采样矢量场（OBMC 式平滑：块中心之间插值，消除块状接缝）
 static inline Vec2 sample_vec_b(const vector<Vec2> &v, int bw, int bh, int B, int x, int y) {
     float fx = (float)x / B - 0.5f, fy = (float)y / B - 0.5f;
     int x0 = (int)floorf(fx), y0 = (int)floorf(fy);
@@ -277,6 +287,7 @@ int main(int argc, char **argv) {
         fprintf(stderr, "k=%d pyr\n", k);
         // 金字塔
         pa[0] = a; pb[0] = b;
+        if (opt & 8192) { blur3(pa[0]); blur3(pb[0]); }
         for (int l = 1; l < LEVELS; l++) { down2(pa[l - 1], pa[l]); down2(pb[l - 1], pb[l]); }
         // 粗到细块匹配（可双向：A→B 与 B→A）
         auto mkfield = [&](vector<Img> &A, vector<Img> &Bs, vector<Vec2> &out, int &ow, int &oh) {
@@ -300,7 +311,8 @@ int main(int argc, char **argv) {
         vector<Vec2> cur;
         mkfield(pa, pb, cur, nbw, nbh);
         vector<Vec2> gfield; int gw = 0, gh = 0;
-        if (opt & 1024) mkfield(pb, pa, gfield, gw, gh);
+        // 反向场始终要算：合成阶段用它做双向一致性校验，遮盖/遮挡区才不会糊成重影
+        mkfield(pb, pa, gfield, gw, gh);
         // opt&8: 在最细层再做一遍 4×4 块精修（矢量场加密，减少块状接缝）
         if (opt & 8) {
             int B2 = 4;
@@ -355,7 +367,7 @@ int main(int argc, char **argv) {
             uint8_t *oy = out.data(), *ou = out.data() + ysz, *ov = ou + csz;
             for (int y = 0; y < H; y++) {
                 for (int x = 0; x < W; x++) {
-                    Vec2 v = (opt & 256) ? sample_vec_b(cur, bw, bh, B, x, y) : sample_vec(cur, bw, bh, B, x, y);
+                    Vec2 v = (opt & 256) ? sample_vec_b(cur, bw, bh, B, x, y) : sample_vech(cur, bw, bh, B, x, y);
                     float c = conf[(size_t)(y / B) * bw + (x / B)];
                     if (opt & 4) c = 1.0f;
                     // 多假设：取像素四周 4 个块的矢量作候选，按双向一致性 WTA 选一个（OBMC 式）
@@ -386,20 +398,31 @@ int main(int argc, char **argv) {
                     }
                     float x0 = x - v.x * t, y0 = y - v.y * t;
                     float x1 = x + v.x * (1 - t), y1 = y + v.y * (1 - t);
-                    if (opt & 1024 && gw > 0) {
-                        Vec2 g = sample_vec(gfield, gw, gh, B, x, y);
-                        x1 = x - g.x * (1 - t); y1 = y - g.y * (1 - t);
-                    }
                     bool in0 = x0 >= 0 && y0 >= 0 && x0 <= W - 1 && y0 <= H - 1;
                     bool in1 = x1 >= 0 && y1 >= 0 && x1 <= W - 1 && y1 <= H - 1;
                     float p0 = in0 ? bilin(a, x0, y0) : 0, p1 = in1 ? bilin(b, x1, y1) : 0;
-                    float w0 = in0 ? (1 - t) * (0.35f + 0.65f * c) : 0;
-                    float w1 = in1 ? t * (0.35f + 0.65f * c) : 0;
+                    float tm = bilin(a, (float)x, (float)y) * (1 - t) + bilin(b, (float)x, (float)y) * t;
                     float val;
-                    if (w0 + w1 < 1e-4f) {
-                        val = bilin(a, (float)x, (float)y) * (1 - t) + bilin(b, (float)x, (float)y) * t;
+                    if (!in0 && !in1) {
+                        val = tm;
                     } else {
-                        val = (p0 * w0 + p1 * w1) / (w0 + w1);
+                        // 双向一致性：从 a 走到 b 得到 v，再用 b 侧的反向场走回来，长度应互相抵消。
+                        // 对不上说明这一点在中间帧被遮挡或矢量已经错了，此时错位平均就是重影/果冻，
+                        // 按误差大小逐步退回时间插值，宁可略糊也不要果冻。
+                        float ok = 1.0f;
+                        // 只有「两侧 warp 后还对不上」才算真遮挡；对得上就保持锐利，别乱退化成糊
+                        if ((opt & 2048) && gw > 0 && in0 && in1 && fabsf(p0 - p1) > 20.0f) {
+                            Vec2 g = sample_vec_b(gfield, gw, gh, B, x + v.x, y + v.y);
+                            float ex = v.x + g.x, ey = v.y + g.y;
+                            float r = sqrtf(ex * ex + ey * ey);
+                            ok = 1.0f - (r - 0.75f) / 2.25f;
+                            if (ok < 0) ok = 0;
+                            if (ok > 1) ok = 1;
+                        }
+                        float w0 = in0 ? (1 - t) : 0;
+                        float w1 = in1 ? t : 0;
+                        float warped = (w0 + w1 < 1e-4f) ? tm : (p0 * w0 + p1 * w1) / (w0 + w1);
+                        val = warped * ok + tm * (1 - ok);
                     }
                     oy[(size_t)y * W + x] = (uint8_t)std::max(0, std::min(255, (int)lroundf(val)));
                 }
@@ -407,7 +430,7 @@ int main(int argc, char **argv) {
             // 色度：按 8x8 块矢量直接搬
             for (int y = 0; y < H / 2; y++) {
                 for (int x = 0; x < W / 2; x++) {
-                    Vec2 v = (opt & 256) ? sample_vec_b(cur, bw, bh, B, x * 2, y * 2) : sample_vec(cur, bw, bh, B, x * 2, y * 2);
+                    Vec2 v = (opt & 256) ? sample_vec_b(cur, bw, bh, B, x * 2, y * 2) : sample_vech(cur, bw, bh, B, x * 2, y * 2);
                     float x0 = x - v.x * t * 0.5f, y0 = y - v.y * t * 0.5f;
                     float x1 = x + v.x * (1 - t) * 0.5f, y1 = y + v.y * (1 - t) * 0.5f;
                     const uint8_t *au = fa.data() + ysz, *av = au + csz;
@@ -431,6 +454,11 @@ int main(int argc, char **argv) {
             done++;
         }
         fa.swap(fb);
+    }
+    // 收尾：最后一帧没有后继帧可插，直接照抄，否则每段少一帧、段尾会顿一下
+    if (done > 0) {
+        fwrite(fa.data(), 1, fsz, fo);
+        done++;
     }
     fclose(fi); fclose(fo);
     fprintf(stderr, "wrote %d frames dup=%d\n", done, ndup);

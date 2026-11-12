@@ -24,6 +24,7 @@ import java.util.Date;
 import java.util.List;
 import java.util.Locale;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicReference;
 
 /**
  * SCB-MCI 补帧引擎：minterpolate + 帧精确分段并行 + 音轨回封 + 相册落盘。
@@ -42,6 +43,45 @@ public class Engine {
     static final String MCI_TAIL =
             ":mi_mode=mci:mc_mode=aobmc:me_mode=bilat:me=epzs:search_param=32"
             + ":mb_size=16:vsbmc=1:scd=fdiff:scd_threshold=8";
+
+    /**
+     * 降级用的替换参数。minterpolate 在小尺寸、非 16 对齐的源上会让某些机型崩掉，
+     * 换一条代码路径比拼参数更有用：obmc/bidir 和 aobmc/bilat 走的是不同的预测分支。
+     */
+    static String tailFor(int attempt) {
+        if (attempt == 3) {
+            return ":mi_mode=mci:mc_mode=obmc:me_mode=bidir:me=epzs:search_param=32"
+                    + ":mb_size=16:vsbmc=0:scd=fdiff:scd_threshold=8";
+        }
+        if (attempt == 4) {
+            return ":mi_mode=mci:mc_mode=obmc:me_mode=bilat:me=epzs:search_param=16"
+                    + ":mb_size=8:vsbmc=0:scd=fdiff:scd_threshold=8";
+        }
+        if (attempt == 5) {
+            return ":mi_mode=blend";
+        }
+        return MCI_TAIL;
+    }
+
+    /** 每档降级做了什么，写进日志用。 */
+    static String stageName(int attempt) {
+        switch (attempt) {
+            case 1:
+                return "单线程";
+            case 2:
+                return "单线程 + x264 纯 C";
+            case 3:
+                return "换 obmc/bidir 预测 + 关可变块";
+            case 4:
+                return "小块 8×8 + 小搜索半径";
+            case 5:
+                return "关闭运动估计，改帧混合";
+            case 6:
+                return "关闭 minterpolate，纯复制插帧";
+            default:
+                return "原始参数";
+        }
+    }
 
     public interface Cb {
         void progress(String phase, int done, int total, long etaMs);
@@ -239,6 +279,8 @@ public class Engine {
                 } catch (Throwable t) {
                     if (cancel) {
                         note("job", "用户取消");
+                        // 取消后把本次的分段与累加流删掉：不删的话它们会一直占着缓存分区直到下次开工。
+                        wipeTemp(ctx);
                         cb.fail("已取消", detail("已取消"));
                         return;
                     }
@@ -297,7 +339,8 @@ public class Engine {
 
         // 段数跟并发解耦：每段约 30 秒。段一做完就并进累加文件并删掉，
         // 所以长视频的磁盘峰值是「成品 + 在跑的几段」，不是「整片 ×2」。
-        int segments = (int) Math.max(workers, Math.min(240, Math.ceil(dur / 30.0)));
+        // 每段 20 秒：段越短，某一段崩掉后重跑的代价越小，进度也跳得越细。
+        int segments = (int) Math.max(workers, Math.min(240, Math.ceil(dur / 20.0)));
         segments = Math.min(segments, Math.max(1, totalOut / 24));
         workers = Math.min(workers, Math.max(1, totalOut));
         segments = Math.min(Math.max(segments, workers), Math.max(1, totalOut));
@@ -311,10 +354,11 @@ public class Engine {
             }
         }
 
-        // 峰值估算：累加文件(≈成品) + 正在跑的几段(≈成品/段数×并发) + 源副本
+        // 峰值估算：累加流 acc.ts(≈成品) + 成品 out.mp4(≈成品) + 源副本 + 余量。
+        // 以前只算 1.25 份成品，最后一步封装写成品时会撑爆，跑到收尾才报错。
         long srcMb = src.length() / 1048576L;
         long outMb = srcMb * mult;
-        long needMb = outMb + outMb / 4L + srcMb + 96L;
+        long needMb = outMb * 2 + srcMb + 96L;
         long avail = freeMb(ctx.getCacheDir());
         note("disk", "源文件 " + (src.length() / 1048576L) + " MB · 预计峰值 " + needMb
                 + " MB · 缓存分区可用 " + avail + " MB");
@@ -343,7 +387,7 @@ public class Engine {
         final List<Worker> workersList = Collections.synchronizedList(new ArrayList<Worker>());
         final Assembler asm = new Assembler(new File(tempDir, "acc.ts"));
         final AtomicInteger cursor = new AtomicInteger(0);
-        final String[] fatal = new String[1];
+        final AtomicReference<String> fatal = new AtomicReference<String>();
         final int segs = segments;
         final double durS = dur;
         final double inFpsF = inFps;
@@ -358,7 +402,7 @@ public class Engine {
         for (int w = 0; w < workers; w++) {
             Thread t = new Thread(new Runnable() {
                 public void run() {
-                    while (!cancel && fatal[0] == null) {
+                    while (!cancel && fatal.get() == null) {
                         int i = cursor.getAndIncrement();
                         if (i >= segs) {
                             return;
@@ -372,30 +416,30 @@ public class Engine {
                         File out = new File(tmpF,
                                 "c" + String.format(Locale.US, "%03d", Integer.valueOf(i)) + ".ts");
                         Worker wk = new Worker(ffF, srcF, out, s0, s1, inFpsF, outFpsF, n,
-                                mult, errors, totalF, tStart, ii.w, ii.h);
+                                mult, errors, totalF, tStart, ii.w, ii.h, durS);
                         wk.run();
-                        // 并发过高时 ffmpeg 会被系统直接杀掉（139/137）：两次降级重跑，一次比一次保守
-                        for (int att = 1; att <= 2 && !wk.ok(); att++) {
+                        // 设备上 ffmpeg 可能整段崩掉（139/137）。逐级降级：越往后越保守，
+                        // 最后一档索性不做运动估计，保证能出片。
+                        for (int att = 1; att <= 6 && !wk.ok() && !cancel; att++) {
                             String old = wk.failure;
                             wk.failure = null;
                             wk.attempt = att;
                             note("job", "第 " + (i + 1) + " 段失败，第 " + att + " 次降级重跑（"
-                                    + (old == null ? "?" : old) + "）· "
-                                    + (att == 1 ? "单线程" : "单线程 + x264 纯 C"));
+                                    + (old == null ? "?" : old) + "）· " + stageName(att));
                             wk.run();
                             if (old != null) {
                                 errors.remove(old);
                             }
                         }
                         if (!wk.ok()) {
-                            fatal[0] = wk.failure != null ? wk.failure : "分段编码失败";
+                            fatal.set(wk.failure != null ? wk.failure : "分段编码失败");
                             return;
                         }
                         workersList.add(wk);
                         try {
                             asm.put(i, out);
                         } catch (Throwable e) {
-                            fatal[0] = e.getMessage() == null ? "并合分段失败" : e.getMessage();
+                            fatal.set(e.getMessage() == null ? "并合分段失败" : e.getMessage());
                             return;
                         }
                     }
@@ -413,8 +457,8 @@ public class Engine {
         if (cancel) {
             throw new Exception("cancel");
         }
-        if (fatal[0] != null) {
-            throw new Exception(fatal[0]);
+        if (fatal.get() != null) {
+            throw new Exception(fatal.get());
         }
         if (!asm.ok()) {
             throw new Exception("分段编码失败：产物不完整");
@@ -430,15 +474,15 @@ public class Engine {
         cb.progress("正在保存", -1, totalOut, -1);
         String name = "ALHFrame_" + stamp() + "_" + mult + "x.mp4";
         File outFile = new File(tempDir, name);
-        Mux m = mux(ff, joined, src, outFile, ii.hasAudio ? "copy" : null);
+        Mux m = mux(ff, joined, src, outFile, ii.hasAudio ? "copy" : null, (double) totalOut / outFps);
         if (m.rc != 0 && ii.hasAudio) {
             note("merge", "音轨直拷失败，改重编码 AAC：rc=" + m.rc + " " + oneLine(m.err.toString()));
-            m = mux(ff, joined, src, outFile, "aac");
+            m = mux(ff, joined, src, outFile, "aac", (double) totalOut / outFps);
         }
         if (m.rc != 0) {
             note("merge", "音轨回封再次失败，改为无音轨输出：rc=" + m.rc + " "
                     + oneLine(m.err.toString()));
-            m = mux(ff, joined, src, outFile, null);
+            m = mux(ff, joined, src, outFile, null, (double) totalOut / outFps);
         }
         if (m.rc != 0) {
             throw new Exception("封装失败：" + tail(m.err, m.rc));
@@ -513,6 +557,7 @@ public class Engine {
         final double outFps;
         final int frames;      // 本段应产出帧数（= round(tEnd*outFps) - round(tStart*outFps)）
         final int vw, vh;      // 源宽高（用于 16 对齐补边）
+        final double srcDur;   // 源总时长，用来避免在片尾之后继续读
         final int mult;
         final List<String> errors;
         final int total;
@@ -529,7 +574,7 @@ public class Engine {
 
         Worker(String ff, File src, File out, double tStart, double tEnd, double srcFps,
                double outFps, int frames, int mult, List<String> errors, int total, long t0,
-               int vw, int vh) {
+               int vw, int vh, double srcDur) {
             this.ff = ff;
             this.src = src;
             this.out = out;
@@ -544,39 +589,56 @@ public class Engine {
             this.t0 = t0;
             this.vw = vw;
             this.vh = vh;
+            this.srcDur = srcDur;
         }
 
         void report(int done) {
             int t = totalOut;
             long ms = System.currentTimeMillis() - t0;
             long eta = done > 0 ? (long) ((double) ms * (t - done) / done) : -1;
-            cb.progress("正在补帧", Math.min(done, t), t, eta);
+            cb.progress(attempt == 0 ? "正在补帧" : "正在补帧 · " + stageName(attempt),
+                    Math.min(done, t), t, eta);
         }
 
         public void run() {
+            // 重跑：先把上一轮已经计入总量的帧数退回去。否则重跑时第二遍又从头累加，
+            // 进度条冲到 100% 就再也不动，看起来像卡在最后一张。
+            if (localFrames > 0) {
+                doneFrames.addAndGet(-localFrames);
+                localFrames = 0;
+            }
             // 时间轴切段：-ss 到本段起点，多读 2 帧供末帧插值，再用 end_frame 精确截到本段帧数。
             // 不再「丢掉开头 mult 帧」——那是把一个源帧的时长白扔了，段与段之间会缺帧、总时长变短。
             String ss = fmt(tStart);
-            String dur = fmt((tEnd - tStart) + 2.0 / srcFps);
+            double want = (tEnd - tStart) + 2.0 / srcFps;
+            if (srcDur > 0) {
+                // 读取窗绝不越过文件尾。越过之后解码器会一直吐末帧，而 minterpolate
+                // 处理这些末尾重复帧时在部分机型上直接 SIGSEGV（退出码 139）。
+                // 少的那一两帧交给后面的 tpad 克隆补，不经过运动估计。
+                double left = Math.max(1.0 / srcFps, srcDur - tStart);
+                if (left < want) {
+                    want = left;
+                }
+            }
+            String dur = fmt(want);
             StringBuilder vf = new StringBuilder();
-            // minterpolate 按 16×16 块做运动估计，宽高不是 16 的整数倍时边缘会越界读，
-            // 部分机型直接 SIGSEGV（退出码 139）。补边到 16 的倍数，算完再裁回原尺寸。
-            int pw = (vw + 15) / 16 * 16;
-            int ph = (vh + 15) / 16 * 16;
-            boolean padded = pw != vw || ph != vh;
-            if (padded) {
-                vf.append("pad=").append(pw).append(':').append(ph).append(":0:0,");
+            // 两条禁忌，都实测过：
+            // 1) 不能用 pad —— ffmpeg 9.0.2 在 1080×1620 上 pad+minterpolate 必崩，不补边反而正常；
+            // 2) 不能在 minterpolate 前面挂 tpad —— 那是把克隆帧喂进运动估计，片尾必崩。
+            if (attempt >= 6) {
+                // 最后一档：完全不用 minterpolate，纯插帧复制。质量等同 30fps 内容放 96fps，
+                // 但这条路径只碰 fps 滤镜，任何机型都能跑完。
+                vf.append("fps=").append(fmt(outFps));
+            } else {
+                vf.append("minterpolate=fps=").append(fmt(outFps)).append(tailFor(attempt));
             }
-            vf.append("tpad=stop_mode=clone:stop_duration=");
-            vf.append(fmt(3.0 / srcFps)).append(',');
-            vf.append("minterpolate=fps=").append(fmt(outFps)).append(MCI_TAIL);
+            // 片尾追加克隆：minterpolate 在输入到文件尾时可能少吐一帧，这里补足
+            vf.append(",tpad=stop_mode=clone:stop_duration=0.2");
             vf.append(",trim=end_frame=").append(frames);
-            if (padded) {
-                vf.append(",crop=").append(vw).append(':').append(vh).append(":0:0");
-            }
-            // 时间戳直接落到全局帧位：段与段按字节拼接后时间轴天然连续
-            vf.append(",setpts=PTS-STARTPTS+").append(Math.round(tStart * outFps))
-              .append("/(").append(fmt(outFps)).append("*TB)");
+            // 时间戳按帧序号重建：本段第 k 帧 = 全局第 (F0+k) 帧。
+            // 用 PTS-STARTPTS 加偏移的话，片尾克隆帧会把时间戳拉开，拼接后就是一顿一顿。
+            vf.append(",setpts=N/(").append(fmt(outFps)).append("*TB)+")
+              .append(Math.round(tStart * outFps)).append("/(").append(fmt(outFps)).append("*TB)");
 
             List<String> c = new ArrayList<String>();
             c.add(ff);
@@ -677,10 +739,17 @@ public class Engine {
                 note("cmd", out.getName() + " 退出码 " + rc
                         + (rc == 0 ? "" : " · stderr 尾部: " + oneLine(err.toString())));
                 if (rc != 0 && !cancel) {
-                    failure = "分段编码失败：" + tail(err, rc);
+                    failure = "分段编码失败（本段已输出 " + localFrames + "/" + frames
+                            + " 帧）：" + tail(err, rc);
                     errors.add(failure);
                 } else if (rc == 0) {
                     failure = null;
+                    // 退出码 0 不代表帧数齐。片尾被截或解码提前结束都会让某段少几帧，
+                    // 成片里就是一次可见的卡顿，所以这里按帧数复核，缺得多就当失败重跑。
+                    if (localFrames > 0 && localFrames < frames - 2) {
+                        failure = "分段帧数不足（本段 " + localFrames + "/" + frames + " 帧）";
+                        errors.add(failure);
+                    }
                 }
             } catch (Exception e) {
                 if (p != null) {
@@ -688,7 +757,7 @@ public class Engine {
                 }
                 note("cmd", out.getName() + " 启动/读取异常: " + shortErr(e));
                 if (!cancel) {
-                    failure = "分段编码失败：" + shortErr(e);
+                    failure = "分段编码失败（启动阶段）：" + shortErr(e);
                     errors.add(failure);
                 }
             }
@@ -697,7 +766,7 @@ public class Engine {
 
     // ------------------------------------------------------------------ 封装与落盘
 
-    Mux mux(String ff, File joined, File src, File out, String acodec) {
+    Mux mux(String ff, File joined, File src, File out, String acodec, double seconds) {
         Mux m = new Mux();
         List<String> c = new ArrayList<String>();
         c.add(ff);
@@ -724,6 +793,12 @@ public class Engine {
         }
         c.add("-c:v");
         c.add("copy");
+        if (seconds > 0) {
+            // 把封装长度钉在视频长度上：源音轨比视频长时，
+            // 不钉的话进度条/时长会跟着音轨走，播完画面还要空转几秒。
+            c.add("-t");
+            c.add(fmt(seconds));
+        }
         c.add("-movflags");
         c.add("+faststart");
         c.add(out.getAbsolutePath());
@@ -1007,6 +1082,13 @@ public class Engine {
     }
 
     /** 启动时顺手清理上次残留；返回释放的字节数。 */
+    /** 只清临时工作目录，保留 cache/in 里的源副本（用户可能还要重试）。 */
+    static void wipeTemp(Context c) {
+        synchronized (CACHE_LOCK) {
+            delTree(new File(c.getCacheDir(), "alhframe"));
+        }
+    }
+
     static long wipeCache(Context c) {
         synchronized (CACHE_LOCK) {
             long n = 0;

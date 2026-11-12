@@ -7,6 +7,7 @@ import android.content.ClipboardManager;
 import android.content.Intent;
 import android.content.pm.PackageManager;
 import android.graphics.Bitmap;
+import android.graphics.Matrix;
 import android.graphics.drawable.Drawable;
 import android.graphics.drawable.GradientDrawable;
 import android.media.MediaMetadataRetriever;
@@ -442,6 +443,7 @@ public class MainActivity extends Activity {
         btnCancel.setText("取消");
         getWindow().addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
 
+        Keep.start(this);
         engine = new Engine(this, new Engine.Cb() {
             public void progress(final String phase, final int done, final int total,
                                  final long eta) {
@@ -495,6 +497,11 @@ public class MainActivity extends Activity {
                         finishUi();
                         bar.setIndeterminate(false);
                         bar.setVisibility(View.GONE);
+                        if ("已取消".equals(msg)) {
+                            tvStatus.setText("已取消");
+                            tvSub.setText("");
+                            return;
+                        }
                         tvStatus.setText("处理失败");
                         tvSub.setText("可重新开始，或改用其他编码格式的源文件。");
                         Sheet.error(MainActivity.this, "处理失败", msg, detail);
@@ -506,6 +513,7 @@ public class MainActivity extends Activity {
     }
 
     private void finishUi() {
+        Keep.stop(this);
         running = false;
         engine = null;
         btnPick.setEnabled(true);
@@ -647,11 +655,33 @@ public class MainActivity extends Activity {
     private Bitmap firstFrame(File f) {
         MediaMetadataRetriever r = new MediaMetadataRetriever();
         Bitmap bmp = null;
+        int rot = 0;
         try {
             r.setDataSource(f.getAbsolutePath());
-            bmp = r.getFrameAtTime(0, MediaMetadataRetriever.OPTION_CLOSEST_SYNC);
+            // 4K/8K 源直接取整帧可能几十上百 MB，先让系统解一张缩略图出来。
+            if (Build.VERSION.SDK_INT >= 27) {
+                try {
+                    bmp = r.getScaledFrameAtTime(0, MediaMetadataRetriever.OPTION_CLOSEST_SYNC,
+                            720, 720);
+                } catch (Throwable ignored) {
+                    bmp = null;
+                }
+            }
+            if (bmp == null) {
+                bmp = r.getFrameAtTime(0, MediaMetadataRetriever.OPTION_CLOSEST_SYNC);
+            }
             if (bmp == null) {
                 bmp = r.getFrameAtTime(0);
+            }
+            // 手机拍的竖屏视频实际存的是横屏帧 + rotation 标记，
+            // 这里取的帧不会自动转，不手动转一下缩略图就是躺着的。
+            String rs = r.extractMetadata(MediaMetadataRetriever.METADATA_KEY_VIDEO_ROTATION);
+            if (rs != null) {
+                try {
+                    rot = Integer.parseInt(rs.trim());
+                } catch (Throwable ignored) {
+                    rot = 0;
+                }
             }
         } catch (Throwable ignored) {
         } finally {
@@ -662,6 +692,19 @@ public class MainActivity extends Activity {
         }
         if (bmp == null) {
             return null;
+        }
+        if (rot == 90 || rot == 270) {
+            try {
+                Matrix m = new Matrix();
+                m.postRotate(rot);
+                Bitmap turned = Bitmap.createBitmap(bmp, 0, 0,
+                        bmp.getWidth(), bmp.getHeight(), m, true);
+                if (turned != bmp) {
+                    bmp.recycle();
+                    bmp = turned;
+                }
+            } catch (Throwable ignored) {
+            }
         }
         int max = Math.max(bmp.getWidth(), bmp.getHeight());
         if (max > 720) {

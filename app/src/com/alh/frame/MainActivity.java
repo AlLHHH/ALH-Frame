@@ -64,7 +64,7 @@ public class MainActivity extends Activity {
     /** 引擎选择：0 = ALH Frame Lite，1 = ALH Frame Standard。 */
     int engineMode = 0;
     boolean dedup = false;
-    final Button[] engBtns = new Button[2];
+    TextView tvEngine;
     TextView tvEngineNote;
     Button btnDedup;
     Button btnCancel;
@@ -261,35 +261,40 @@ public class MainActivity extends Activity {
         col.addView(seg, lp(-1, -2, 0, 0, 0, dp(22)));
         setMult(0);
 
-        // 引擎选择：Lite 走 ffmpeg minterpolate，Pro 走自研内核（有去重复帧）
-        TextView elabel = text("补帧引擎", 12, C_DIM, false);
-        elabel.setLetterSpacing(0.08f);
-        col.addView(elabel, lp(-1, -2, dp(2), 0, 0, dp(10)));
-
-        LinearLayout eseg = new LinearLayout(this);
-        eseg.setOrientation(LinearLayout.HORIZONTAL);
-        eseg.setBackground(round(C_OFF, dp(14)));
-        eseg.setPadding(dp(4), dp(4), dp(4), dp(4));
-        String[] names = {"ALH Frame Lite", "ALH Frame Standard"};
-        for (int i = 0; i < names.length; i++) {
-            final int idx = i;
-            Button bt = button(names[i], false);
-            bt.setBackground(round(0x00000000, dp(10)));
-            bt.setTextColor(C_DIM);
-            bt.setOnClickListener(new View.OnClickListener() {
-                public void onClick(View v) {
-                    if (running) {
-                        return;
-                    }
-                    setEngine(idx);
+        // 引擎选择：下拉框，两个名字都放得下，不会换行
+        LinearLayout erow = new LinearLayout(this);
+        erow.setOrientation(LinearLayout.HORIZONTAL);
+        erow.setGravity(android.view.Gravity.CENTER_VERTICAL);
+        TextView elabel = text("补帧引擎", 13, C_DIM, false);
+        elabel.setLetterSpacing(0.06f);
+        erow.addView(elabel, lp(-2, -2, dp(2), 0, dp(12), 0));
+        tvEngine = text(ENGINE_NAMES[0], 15, C_TEXT, false);
+        tvEngine.setSingleLine(true);
+        tvEngine.setEllipsize(TextUtils.TruncateAt.END);
+        tvEngine.setGravity(android.view.Gravity.CENTER_VERTICAL);
+        tvEngine.setBackground(round(C_OFF, dp(12)));
+        tvEngine.setPadding(dp(14), 0, dp(14), 0);
+        tvEngine.setOnClickListener(new View.OnClickListener() {
+            public void onClick(View v) {
+                if (!running) {
+                    showEngineMenu(v);
                 }
-            });
-            LinearLayout.LayoutParams p = lp(0, dp(40), 0, 0, 0, 0);
-            p.weight = 1f;
-            eseg.addView(bt, p);
-            engBtns[i] = bt;
-        }
-        col.addView(eseg, lp(-1, -2, 0, dp(10), 0, 0));
+            }
+        });
+        LinearLayout.LayoutParams ep = lp(0, dp(46), 0, 0, 0, 0);
+        ep.weight = 1f;
+        erow.addView(tvEngine, ep);
+        TextView arrow = text("▾", 13, C_DIM, false);
+        arrow.setPadding(dp(6), 0, 0, 0);
+        arrow.setOnClickListener(new View.OnClickListener() {
+            public void onClick(View v) {
+                if (!running && tvEngine != null) {
+                    showEngineMenu(tvEngine);
+                }
+            }
+        });
+        erow.addView(arrow, lp(-2, -2, 0, 0, 0, 0));
+        col.addView(erow, lp(-1, -2, 0, 0, 0, dp(8)));
 
         tvEngineNote = text("", 12, C_DIM, false);
         tvEngineNote.setLineSpacing(dp(2), 1f);
@@ -460,19 +465,45 @@ public class MainActivity extends Activity {
 
     // ------------------------------------------------------------------ 流程
 
+    static final String[] ENGINE_NAMES = {"ALH Frame Lite", "ALH Frame Standard"};
+
+    // 自绘下拉：黑卡片 + 两行选项，避系统弹出的白边框
+    private void showEngineMenu(View anchor) {
+        final android.widget.PopupWindow[] holder = new android.widget.PopupWindow[1];
+        LinearLayout box = new LinearLayout(this);
+        box.setOrientation(LinearLayout.VERTICAL);
+        GradientDrawable bg = (GradientDrawable) round(C_CARD, dp(14));
+        bg.setStroke(dp(1), 0xFF232C3A);
+        box.setBackground(bg);
+        box.setPadding(0, dp(6), 0, dp(6));
+        for (int i = 0; i < ENGINE_NAMES.length; i++) {
+            final int idx = i;
+            TextView row = text(ENGINE_NAMES[i], 15, i == engineMode ? C_ACC : C_TEXT, false);
+            row.setSingleLine(true);
+            row.setPadding(dp(16), dp(13), dp(16), dp(13));
+            row.setOnClickListener(new View.OnClickListener() {
+                public void onClick(View v) {
+                    setEngine(idx);
+                    if (holder[0] != null) {
+                        holder[0].dismiss();
+                    }
+                }
+            });
+            box.addView(row, lp(-1, -2, 0, 0, 0, 0));
+        }
+        final android.widget.PopupWindow pop = new android.widget.PopupWindow(box,
+                anchor.getWidth(), LinearLayout.LayoutParams.WRAP_CONTENT, true);
+        holder[0] = pop;
+        pop.setBackgroundDrawable(new android.graphics.drawable.ColorDrawable(0x00000000));
+        pop.setOutsideTouchable(true);
+        pop.setElevation(dp(10));
+        pop.showAsDropDown(anchor, 0, dp(6));
+    }
+
     private void setEngine(int e) {
         engineMode = e;
-        for (int i = 0; i < engBtns.length; i++) {
-            if (engBtns[i] == null) {
-                continue;
-            }
-            if (i == e) {
-                engBtns[i].setBackground(round(C_ACC, dp(10)));
-                engBtns[i].setTextColor(-1);
-            } else {
-                engBtns[i].setBackground(round(0x00000000, dp(10)));
-                engBtns[i].setTextColor(C_DIM);
-            }
+        if (tvEngine != null) {
+            tvEngine.setText(ENGINE_NAMES[e]);
         }
         if (tvEngineNote != null) {
             tvEngineNote.setText(e == 1
@@ -526,10 +557,9 @@ public class MainActivity extends Activity {
         for (Button b : mulBtns) {
             b.setEnabled(false);
         }
-        for (Button b : engBtns) {
-            if (b != null) {
-                b.setEnabled(false);
-            }
+        if (tvEngine != null) {
+            tvEngine.setEnabled(false);
+            tvEngine.setTextColor(C_DIM);
         }
         if (btnDedup != null) {
             btnDedup.setEnabled(false);
@@ -623,10 +653,9 @@ public class MainActivity extends Activity {
         for (Button b : mulBtns) {
             b.setEnabled(true);
         }
-        for (Button b : engBtns) {
-            if (b != null) {
-                b.setEnabled(true);
-            }
+        if (tvEngine != null) {
+            tvEngine.setEnabled(true);
+            tvEngine.setTextColor(C_TEXT);
         }
         if (btnDedup != null) {
             btnDedup.setEnabled(engineMode == 1);

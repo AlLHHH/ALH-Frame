@@ -4,7 +4,7 @@
 
 24fps 的素材补到 48 / 72 / 96fps，30fps 的补到 60 / 90 / 120fps。1080p 的片子按 128 ms/输出帧算，十分钟的 2× 成品在八核手机上大约二十多分钟，具体看运动复杂度。
 
-- 包名 `com.alh.frame`，版本 1.2，minSdk 24，targetSdk 28
+- 包名 `com.alh.frame`，版本 1.3，minSdk 24，targetSdk 28
 - 单 Activity，无第三方 Java 依赖，界面是代码搭的
 - 引擎自带 ffmpeg 9.0.2，切成进程池并行跑，段编完立刻并合，不等全片
 
@@ -92,7 +92,14 @@ ffmpeg -ss .. -t .. -i src -an -f rawvideo -pix_fmt yuv420p -
       -c:v libx264 -f mpegts -bf 0 out.ts
 ```
 
-同一份内核出两档，下拉里对应 `ALH Frame Standard` 与 `ALH Frame Pro`。
+下拉是三列，每列按版本堆叠：
+
+| 列 | 版本 | 内核 |
+| --- | --- | --- |
+| Lite | v1 | ffmpeg `minterpolate` |
+| Standard | v1 / v2 | 自研块匹配 / 块匹配 + 亚像素精修 |
+| Pro | v1 | 低分辨率解流场再逐像素择优 |
+| Pro | v2 | 逐像素 DIS 式稠密光流 + 前后向遮挡判断 |
 
 ### Standard：块匹配
 
@@ -107,6 +114,25 @@ ffmpeg -ss .. -t .. -i src -an -f rawvideo -pix_fmt yuv420p -
 运动场不在全分辨率上逐块解，而是先把两帧缩到短边 250（短边 ≥900 时用 400），在那一层跑逐像素 Gauss-Newton 迭代（每轮 [1 2 1] 平滑）求连续流场，再放大回全分辨率；块匹配的结果同时留一份作为候选，每个像素按两端残差挑更准的那个。场是逐像素连续的，没有"一块一个矢量"的方格。
 
 耗时主要在解流场的尺度上，所以画面越大越省：720p 一对比 Standard 快约一成到三成，1080p 以上差距更明显。画质与 Standard 基本持平，纹理极稀疏处会略软。
+
+### Pro v2：逐像素稠密光流
+
+Pro v2 换了一条完全不同的路子：不按块找匹配，逐像素解运动场。
+
+1. 自建 6 层金字塔（`down2` 盒降采样），从最粗层开始；
+2. 每层做三遍 patch 逆向搜索（patch 16/12/8，步长减半、位移上限 2.0/1.5/1.0），块内累积 `gxx,gxy,gyy,bx,by` 解 2×2 正规方程，梯度退化的平坦块（`det < 1e-2·n`）直接跳过；
+3. 每层再跑变分细化（逐像素 Gauss-Newton + [1 2 1] 平滑，最细层平滑系数 0.35、迭代 3 次）；
+4. 反向再解一遍得到 `G`，用 `|F(p) + G(p+F(p))| > 1.5` 判遮挡，遮挡像素按时间就近取单侧颜色，避免两帧幽灵叠在一起。
+
+实测（只比插值帧 SSIM，模拟器 x86_64）：
+
+| 素材 | Standard v1 | Standard v2 | Pro v1 | Pro v2 |
+| --- | --- | --- | --- | --- |
+| foreman 352×288 实拍 15→30 | **0.9497** | 0.9492 | 0.9452 | 0.9447 |
+| 720p 合成 30→60 | **0.9850** | 0.9837 | 0.9807 | 0.9699 |
+| 30 对帧耗时（720p） | 24 s | — | 22 s | 47 s |
+
+结论写在数据里：Pro v2 的场逐像素连续，没有方格，遮挡处不重影；但 SSIM 比块匹配低一档，720p 上也更慢。它是换路，不是免费升级。
 
 单独当命令行工具用的接口见 [native/README.md](native/README.md)。
 
@@ -141,7 +167,7 @@ Pro 某一段跑不动时会自动退到 Standard 出片，不让任务整体失
 不用 Gradle，链路是 `aapt2 → javac → d8 → zipalign → apksigner`：
 
 ```bash
-./build.sh          # 产物：build/ALHFrame-1.2.apk
+./build.sh          # 产物：build/ALHFrame-1.3.apk
 ```
 
 依赖都在 `tools/`：JDK 21、Android SDK build-tools 35.0.0、platforms/android-33。中间文件写 `build/.tmp`，脚本结束自动清掉，`build/` 里只留签名好的 APK。
@@ -172,13 +198,13 @@ native/alhift.cpp                 自研内核源码，可独立编译使用（�
 docs/算法说明.md                  管线、参数、耗时拆解
 docs/THIRD-PARTY.md               第三方组件与许可
 tools/                            图标、界面预览的生成脚本
-build/ALHFrame-1.2.apk
+build/ALHFrame-1.3.apk
 ```
 
 ## 安装
 
 ```bash
-adb install -r build/ALHFrame-1.2.apk
+adb install -r build/ALHFrame-1.3.apk
 ```
 
 签名证书 SHA-256 是 `0c38ea…`，与任何旧版本都不同，装之前先卸载旧包，否则报 `INSTALL_FAILED_UPDATE_INCOMPATIBLE`。

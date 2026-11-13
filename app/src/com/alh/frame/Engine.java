@@ -119,12 +119,10 @@ public class Engine {
     final StringBuilder trace = new StringBuilder();
 
     /** 引擎：0 = ALH Frame Lite（ffmpeg minterpolate），1 = ALH Frame Standard（自研块匹配），2 = ALH Frame Pro（低分辨率稠密流场）。 */
-    // 档位（profile）：0 只用 ffmpeg；1/2 块匹配内核；3/4 光流内核
+    // 档位（profile）：0 Lite 最快 / 1 Standard 均衡 / 2 Pro 最慢但最好
     static final int PROFILE_LITE = 0;
-    static final int PROFILE_STD1 = 1;
-    static final int PROFILE_STD2 = 2;
-    static final int PROFILE_PRO1 = 3;
-    static final int PROFILE_PRO2 = 4;
+    static final int PROFILE_STD = 1;
+    static final int PROFILE_PRO = 2;
 
     int profile = PROFILE_LITE;
     /** 去重复帧：前后帧几乎一致时直接复制，不插值（Pro 内核支持）。 */
@@ -293,10 +291,11 @@ public class Engine {
                       final int engineMode, final boolean dedupOn) {
         this.profile = engineMode;
         this.dedup = dedupOn;
-        this.proBin = engineMode == PROFILE_LITE ? null : Pro.bin(ctx);
-        if (engineMode != PROFILE_LITE && proBin == null) {
-            note("pro", "当前架构没有自研内核，回落 Lite");
-            this.profile = PROFILE_LITE;
+        // 三档都走自研内核，靠搜索半径 / 匹配窗 / 亚像素精修拉开质量与耗时。
+        // 内核释放失败（架构不支持）时统一回落到 ffmpeg 路径，保证还能出片。
+        this.proBin = Pro.bin(ctx);
+        if (proBin == null) {
+            note("pro", "当前架构没有自研内核，回落 ffmpeg 路径");
         }
         new Thread(new Runnable() {
             public void run() {
@@ -338,18 +337,6 @@ public class Engine {
         long t0 = System.currentTimeMillis();
         cb.progress("正在准备 · 读取源文件", -1, 0, -1);
         Info ii = probe(src);
-
-        // 低分辨率是 ffmpeg 的死角：360p 上 epzs 基本给零矢量，minterpolate 退化成对半淡入淡出，
-        // 看着就是「局部糊、局部跳」。这一档来自研内核反而又快又清楚，所以自动顶上。
-        if (profile == PROFILE_LITE && proBin == null && (long) ii.w * ii.h <= 640L * 480L) {
-            String pb = Pro.bin(ctx);
-            if (pb != null) {
-                proBin = pb;
-                profile = PROFILE_PRO1;
-                note("pro", "源分辨率 " + ii.w + "×" + ii.h + " 偏低，ffmpeg 在这档基本只做淡入淡出，"
-                        + "本次自动改用自研内核");
-            }
-        }
 
         double inFps = ii.fps;
         double dur = ii.durSec;
@@ -660,13 +647,13 @@ public class Engine {
                 }
             }
             String dur = fmt(want);
-            if (profile != PROFILE_LITE && proBin != null && attempt == 0) {
+            if (proBin != null && attempt == 0) {
                 runPro(ss, want);
                 return;
             }
-            if (profile != PROFILE_LITE && proBin != null) {
+            if (proBin != null) {
                 // 自研内核这一档没跑通，重跑时换成 ffmpeg 路径：宁可慢一点也要出片
-                note("pro", out.getName() + " 改走 Lite 路径重跑");
+                note("pro", out.getName() + " 改走 ffmpeg 路径重跑");
             }
             StringBuilder vf = new StringBuilder();
             // 两条禁忌，都实测过：
@@ -828,9 +815,9 @@ public class Engine {
             // v2 起用上「先解低分辨率流场、再逐像素择优」的路子；Pro 换成块匹配 + 亚像素精修 +
             // 更宽的匹配窗（ALH_WIN=6），慢一倍，梯度与大位移更稳。
             switch (profile) {
-                case 1:  o = 4194304 | 268435456 | 262144; break;                   // 标准 v2
-                case 3:  o = 49413 | 33554432 | 131072 | 262144 | 524288; break;    // Pro v1：质量优先
-                default: o = 49413 | 33554432 | 131072 | 262144;                    // 标准 v1
+                case 2:  o = 49413 | 134217728 | 131072 | 262144 | 524288 | 2097152; break; // Pro：最细层 rad16 + 可见性
+                case 1:  o = 49413 | 33554432 | 131072 | 262144 | 524288; break;          // Standard：rad8
+                default: o = 262144 | 32 | 524288;                                        // Lite：rad6，最省
             }
             if (dedup) o |= 4096;
             final int opt = o;
@@ -839,7 +826,7 @@ public class Engine {
                     + ",setpts=N/(" + fmt(outFps) + "*TB)+" + f0 + "/(" + fmt(outFps) + "*TB)";
             int shortSide = Math.min(vw, vh);
             String env = "ALH_OFRES=" + (shortSide >= 900 ? 400 : 250) + " ";
-            if (profile == 3) env += "ALH_WIN=6 ";
+            if (profile == 2) env += "ALH_WIN=6 ALH_PEN=0.15 ";;
             StringBuilder sb = new StringBuilder();
             sb.append(q(ff)).append(" -hide_banner -nostdin -v error -ss ").append(ss)
                     .append(" -t ").append(fmt(want))

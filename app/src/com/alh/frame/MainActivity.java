@@ -6,6 +6,7 @@ import android.content.ClipData;
 import android.content.ClipboardManager;
 import android.content.Intent;
 import android.content.pm.PackageManager;
+import android.content.res.ColorStateList;
 import android.graphics.Bitmap;
 import android.graphics.Matrix;
 import android.graphics.drawable.Drawable;
@@ -66,7 +67,8 @@ public class MainActivity extends Activity {
     boolean dedup = false;
     TextView tvEngine;
     TextView tvEngineNote;
-    Button btnDedup;
+    LinearLayout rowDedup;
+    Toggle swDedup;
     Button btnCancel;
     Bar bar;
     LinearLayout boxProgress;
@@ -268,7 +270,7 @@ public class MainActivity extends Activity {
         TextView elabel = text("补帧引擎", 13, C_DIM, false);
         elabel.setLetterSpacing(0.06f);
         erow.addView(elabel, lp(-2, -2, dp(2), 0, dp(12), 0));
-        tvEngine = text(ENGINE_NAMES[0], 15, C_TEXT, false);
+        tvEngine = text(labelOf(0), 15, C_TEXT, false);
         tvEngine.setSingleLine(true);
         tvEngine.setEllipsize(TextUtils.TruncateAt.END);
         tvEngine.setGravity(android.view.Gravity.CENTER_VERTICAL);
@@ -300,16 +302,25 @@ public class MainActivity extends Activity {
         tvEngineNote.setLineSpacing(dp(2), 1f);
         col.addView(tvEngineNote, lp(-1, -2, dp(2), dp(6), 0, 0));
 
-        btnDedup = button("去重复帧 关", false);
-        btnDedup.setOnClickListener(new View.OnClickListener() {
-            public void onClick(View v) {
+        // 去重复帧：左右滑动的开关（Lite 档不显示，那个档走 ffmpeg，没有这个功能）
+        rowDedup = new LinearLayout(this);
+        rowDedup.setOrientation(LinearLayout.HORIZONTAL);
+        rowDedup.setGravity(android.view.Gravity.CENTER_VERTICAL);
+        TextView lb = text("去重复帧", 14, C_TEXT, false);
+        rowDedup.addView(lb, new LinearLayout.LayoutParams(0, -2, 1f));
+        swDedup = new Toggle(this);
+        swDedup.setOn(dedup);
+        swDedup.setOnChange(new Toggle.OnChange() {
+            public void onChange(boolean on) {
                 if (running) {
+                    swDedup.setOn(dedup, true);
                     return;
                 }
-                setDedup(!dedup);
+                dedup = on;
             }
         });
-        col.addView(btnDedup, lp(-1, dp(44), 0, dp(6), 0, dp(24)));
+        rowDedup.addView(swDedup, new LinearLayout.LayoutParams(-2, -2));
+        col.addView(rowDedup, lp(-1, dp(44), dp(2), dp(2), 0, dp(22)));
         setEngine(0);
 
         btnStart = button("开始处理", true);
@@ -465,31 +476,49 @@ public class MainActivity extends Activity {
 
     // ------------------------------------------------------------------ 流程
 
-    static final String[] ENGINE_NAMES = {"ALH Frame Lite", "ALH Frame Standard", "ALH Frame Pro"};
+    // 三档，一列一个：Lite 最快 / Standard 均衡 / Pro 最慢但画质最好
+    static final String[] ENGINE_TYPES = {"Lite", "Standard", "Pro"};
+    static final String[] ENGINE_HINT = {"速度优先", "均衡", "质量优先"};
 
-    // 自绘下拉：黑卡片 + 两行选项，避系统弹出的白边框
+    static String labelOf(int code) {
+        return "ALH Frame " + ENGINE_TYPES[code];
+    }
+
+    // 自绘下拉：三列，一列一档，避免系统弹出的白边框
     private void showEngineMenu(View anchor) {
         final android.widget.PopupWindow[] holder = new android.widget.PopupWindow[1];
         LinearLayout box = new LinearLayout(this);
-        box.setOrientation(LinearLayout.VERTICAL);
+        box.setOrientation(LinearLayout.HORIZONTAL);
         GradientDrawable bg = (GradientDrawable) round(C_CARD, dp(14));
         bg.setStroke(dp(1), 0xFF232C3A);
         box.setBackground(bg);
-        box.setPadding(0, dp(6), 0, dp(6));
-        for (int i = 0; i < ENGINE_NAMES.length; i++) {
-            final int idx = i;
-            TextView row = text(ENGINE_NAMES[i], 15, i == engineMode ? C_ACC : C_TEXT, false);
-            row.setSingleLine(true);
-            row.setPadding(dp(16), dp(13), dp(16), dp(13));
-            row.setOnClickListener(new View.OnClickListener() {
+        box.setPadding(dp(4), dp(8), dp(4), dp(8));
+        for (int t = 0; t < ENGINE_TYPES.length; t++) {
+            final int code = t;
+            LinearLayout col = new LinearLayout(this);
+            col.setOrientation(LinearLayout.VERTICAL);
+            col.setPadding(dp(6), dp(6), dp(6), dp(6));
+            col.setBackground(round(code == engineMode ? 0x1A3B82F6 : 0x00000000, dp(10)));
+
+            TextView name = text(ENGINE_TYPES[t], 15, code == engineMode ? C_ACC : C_TEXT, false);
+            name.setSingleLine(true);
+            name.setGravity(android.view.Gravity.CENTER);
+            TextView hint = text(ENGINE_HINT[t], 11, C_DIM, false);
+            hint.setSingleLine(true);
+            hint.setGravity(android.view.Gravity.CENTER);
+            hint.setPadding(0, dp(3), 0, 0);
+
+            col.addView(name, lp(-1, -2, 0, 0, 0, 0));
+            col.addView(hint, lp(-1, -2, 0, 0, 0, 0));
+            col.setOnClickListener(new View.OnClickListener() {
                 public void onClick(View v) {
-                    setEngine(idx);
+                    setEngine(code);
                     if (holder[0] != null) {
                         holder[0].dismiss();
                     }
                 }
             });
-            box.addView(row, lp(-1, -2, 0, 0, 0, 0));
+            box.addView(col, new LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f));
         }
         final android.widget.PopupWindow pop = new android.widget.PopupWindow(box,
                 anchor.getWidth(), LinearLayout.LayoutParams.WRAP_CONTENT, true);
@@ -503,35 +532,31 @@ public class MainActivity extends Activity {
     private void setEngine(int e) {
         engineMode = e;
         if (tvEngine != null) {
-            tvEngine.setText(ENGINE_NAMES[e]);
+            tvEngine.setText(labelOf(e));
         }
         if (tvEngineNote != null) {
-            tvEngineNote.setText(e == 0
-                    ? "基于 ffmpeg minterpolate：复杂运动更稳，推荐日常使用。"
-                    : e == 1
-                    ? "自研内核：块匹配，速度快，细节更锐。"
-                    : "自研内核 Pro：流场在低分辨率上解算再逐像素融合，边缘连续无方格，速度约为标准档的一半。");
-        }
-        if (btnDedup != null) {
-            // 去重复帧是自研内核的开关，Lite 上不显示，免得看成对 ffmpeg 也能用
-            btnDedup.setVisibility(e != 0 ? View.VISIBLE : View.GONE);
-            btnDedup.setEnabled(e != 0);
-            btnDedup.setTextColor(e != 0 ? (dedup ? -1 : C_TEXT) : C_DIM);
-            btnDedup.setBackground(round(e != 0 && dedup ? C_ACC : C_OFF, dp(12)));
-            btnDedup.setText(dedup ? "去重复帧 开" : "去重复帧 关");
+            String note;
             if (e == 0) {
-                dedup = false;
-                btnDedup.setText("去重复帧 关");
+                note = "速度优先：块匹配，搜索半径 6、窄匹配窗，单帧耗时最低，适合长视频快速出片。";
+            } else if (e == 1) {
+                note = "均衡：块匹配，搜索半径 8、加宽匹配窗，启用反向场候选、亚像素精修与边缘引导上采样，耗时约为速度优先档的两倍。";
+            } else {
+                note = "质量优先：双向稠密光流，整幅运动场在短边 400 上解算、放大后做三轮全分辨率精修，遮挡处按前后向一致性只采信一侧，画面连续、没有块边界，耗时约为均衡档的三到五倍。";
             }
+            tvEngineNote.setText(note);
+        }
+        if (rowDedup != null) {
+            // 三档都走自研内核，去重复帧都可用
+            rowDedup.setVisibility(View.VISIBLE);
+            swDedup.setEnabled(true);
+            swDedup.setAlpha(1f);
         }
     }
 
     private void setDedup(boolean on) {
         dedup = on;
-        if (btnDedup != null) {
-            btnDedup.setText(on ? "去重复帧 开" : "去重复帧 关");
-            btnDedup.setBackground(round(on ? C_ACC : C_OFF, dp(12)));
-            btnDedup.setTextColor(on ? -1 : C_TEXT);
+        if (swDedup != null && swDedup.isOn() != on) {
+            swDedup.setOn(on, true);
         }
     }
 
@@ -563,8 +588,8 @@ public class MainActivity extends Activity {
             tvEngine.setEnabled(false);
             tvEngine.setTextColor(C_DIM);
         }
-        if (btnDedup != null) {
-            btnDedup.setEnabled(false);
+        if (swDedup != null) {
+            swDedup.setEnabled(false);
         }
         boxProgress.setVisibility(View.VISIBLE);
         bar.setVisibility(View.VISIBLE);
@@ -659,8 +684,9 @@ public class MainActivity extends Activity {
             tvEngine.setEnabled(true);
             tvEngine.setTextColor(C_TEXT);
         }
-        if (btnDedup != null) {
-            btnDedup.setEnabled(engineMode == 1);
+        if (swDedup != null) {
+            swDedup.setEnabled(engineMode != 0);
+            swDedup.setAlpha(engineMode != 0 ? 1f : 0.4f);
         }
         btnCancel.setVisibility(View.GONE);
         getWindow().clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);

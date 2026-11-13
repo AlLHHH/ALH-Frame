@@ -825,11 +825,12 @@ public class Engine {
             double ratio = outFps / srcFps;
             int nfr = Math.max(2, (int) Math.ceil(want * srcFps) + 1);
             int o;
+            // v2 起用上「先解低分辨率流场、再逐像素择优」的路子；Pro 换成块匹配 + 亚像素精修 +
+            // 更宽的匹配窗（ALH_WIN=6），慢一倍，梯度与大位移更稳。
             switch (profile) {
-                case 2:  o = 49413 | 33554432 | 131072 | 262144 | 524288; break;   // 标准 v2：块匹配 + 亚像素精修
-                case 3:  o = 4194304 | 268435456 | 262144; break;                   // Pro v1：低分辨率解流场再逐像素择优
-                case 4:  o = 1073741824 | 262144; break;                            // Pro v2：DIS 式稠密光流
-                default: o = 49413 | 33554432 | 131072 | 262144;                    // 标准 v1：块匹配
+                case 1:  o = 4194304 | 268435456 | 262144; break;                   // 标准 v2
+                case 3:  o = 49413 | 33554432 | 131072 | 262144 | 524288; break;    // Pro v1：质量优先
+                default: o = 49413 | 33554432 | 131072 | 262144;                    // 标准 v1
             }
             if (dedup) o |= 4096;
             final int opt = o;
@@ -838,6 +839,7 @@ public class Engine {
                     + ",setpts=N/(" + fmt(outFps) + "*TB)+" + f0 + "/(" + fmt(outFps) + "*TB)";
             int shortSide = Math.min(vw, vh);
             String env = "ALH_OFRES=" + (shortSide >= 900 ? 400 : 250) + " ";
+            if (profile == 3) env += "ALH_WIN=6 ";
             StringBuilder sb = new StringBuilder();
             sb.append(q(ff)).append(" -hide_banner -nostdin -v error -ss ").append(ss)
                     .append(" -t ").append(fmt(want))

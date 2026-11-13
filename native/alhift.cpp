@@ -46,7 +46,8 @@ static float g_fal = 0.15f;
 static int g_vmed = 1;        // 稠密场矢量中值（去条纹，保留边缘）   // 全分辨率光流平滑系数
 static float g_da = 0.35f;    // DIS 最细层变分平滑系数（越小越锐、越大越滑）
 static int g_dit = 3;         // DIS 最细层变分迭代次数
-static int g_dp = 0;          // DIS 最细层额外 patch 遍数（每遍 P=8、step=2、maxstep 0.5）
+static int g_dp = 0;
+static float g_dms = 2.0f;   // DIS patch 每轮位移上限（大位移要靠这个放开）          // DIS 最细层额外 patch 遍数（每遍 P=8、step=2、maxstep 0.5）
 
 // 噪声估计：拉普拉斯响应的 MAD/6 ≈ 高斯噪声 σ（灰阶）
 static float y_sigma(const Img &a) {
@@ -952,8 +953,8 @@ static void flow_dis(const Img &A, const Img &B, std::vector<Vec2> &out) {
         // 粗层大步长、细层小步长；patch 尺寸随层收缩，两次错位网格保证覆盖
         fprintf(stderr, "dis lvl=%d %dx%d\n", l, a.w, a.h);
         int P = (l == L - 1) ? 16 : (l == L - 2 ? 12 : 8);
-        patch_pass(a, b, u, v, P, P / 2, 2.0f);
-        patch_pass(a, b, u, v, P, std::max(2, P / 4), 1.5f);
+        patch_pass(a, b, u, v, P, P / 2, g_dms);
+        patch_pass(a, b, u, v, P, std::max(2, P / 4), g_dms * 0.75f);
         patch_pass(a, b, u, v, P, std::max(2, P / 4), 1.0f);
         for (int it = 0; it < (l == 0 ? g_dit : 3); it++)
             flow_level(a, b, u, v, 2, (l == 0) ? g_da : 1.2f);
@@ -1007,6 +1008,7 @@ int main(int argc, char **argv) {
     if (const char *e = getenv("ALH_DA")) g_da = (float)atof(e);
     if (const char *e = getenv("ALH_DIT")) g_dit = atoi(e);
     if (const char *e = getenv("ALH_DP")) g_dp = atoi(e);
+    if (const char *e = getenv("ALH_DMS")) g_dms = (float)atof(e);
     if (const char *e = getenv("ALH_OFRES")) g_ofres = atoi(e);
     if (const char *e = getenv("ALH_HSOUT")) g_hsout = atoi(e);
     if (const char *e = getenv("ALH_HSIN")) g_hsin = atoi(e);
@@ -1036,6 +1038,7 @@ int main(int argc, char **argv) {
 
     int done = 0;
     int ndup = 0;
+    bool dumped = false;   // 自检 dump 只写首对帧，循环外置
     for (int k = 0; k < NFR; k++) {
         if (k > 0) {
             if (k + 1 < NFR) {
@@ -1140,6 +1143,18 @@ int main(int argc, char **argv) {
             gfield.assign((size_t)W * H, Vec2{0.f, 0.f});
             flow_dis(pa[0], pb[0], cur);
             flow_dis(pb[0], pa[0], gfield);
+            // 自检用：把首对帧的逐像素场原样导出（float u,v 交错，行优先）
+            if (!dumped) {
+                if (const char *dp = getenv("ALH_FLOWDUMP")) {
+                    FILE *dfp = fopen(dp, "wb");
+                    if (dfp) {
+                        fwrite(cur.data(), sizeof(Vec2), (size_t)W * H, dfp);
+                        fclose(dfp);
+                        fprintf(stderr, "flowdump %dx%d\n", W, H);
+                    }
+                }
+                dumped = true;
+            }
             nbw = W; nbh = H; gw = W; gh = H;
         } else if (opt & 8388608) {
             // 稠密光流路线：块匹配给大位移种子，稠密迭代把场拉连续、补到亚像素

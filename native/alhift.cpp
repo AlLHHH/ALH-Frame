@@ -42,7 +42,8 @@ struct Vec2 { float x, y; };
 static float g_pen = 0.25f;   // 每像素每位移的惩罚（ffmpeg 等效值 0.25 灰阶/px）
 static int g_win = 2;         // 窗比块每边外扩像素（B=8 → 12×12 窗；比整块 SAD 稳，又不像 2×mb 那么贵）
 static int g_fit = 8;        // 全分辨率光流迭代次数（2/4/6/8 → 0.9431/0.9435/0.9437/0.9438）
-static float g_fal = 0.15f;   // 全分辨率光流平滑系数
+static float g_fal = 0.15f;
+static int g_vmed = 1;        // 稠密场矢量中值（去条纹，保留边缘）   // 全分辨率光流平滑系数
 
 // 噪声估计：拉普拉斯响应的 MAD/6 ≈ 高斯噪声 σ（灰阶）
 static float y_sigma(const Img &a) {
@@ -553,6 +554,25 @@ static void arbitrate(const Img &a, const Img &b, int W, int H,
     }
 }
 
+// 分量中值：3×3 邻域对 u、v 分别取中值。比矢量中值快一个数量级（不用算两两距离），
+// 目的只是抹掉细长条纹；矢量中值实测只多 0.0002 SSIM，不值那 100 ms/帧。
+static void vmedian3(std::vector<Vec2> &f, int w, int h) {
+    std::vector<Vec2> src = f;
+    for (int y = 0; y < h; y++)
+        for (int x = 0; x < w; x++) {
+            float cu[9], cv[9]; int n = 0;
+            for (int dy = -1; dy <= 1; dy++)
+                for (int dx = -1; dx <= 1; dx++) {
+                    int xx = std::max(0, std::min(w - 1, x + dx));
+                    int yy = std::max(0, std::min(h - 1, y + dy));
+                    Vec2 t = src[(size_t)yy * w + xx];
+                    cu[n] = t.x; cv[n] = t.y; n++;
+                }
+            std::sort(cu, cu + 9); std::sort(cv, cv + 9);
+            f[(size_t)y * w + x] = Vec2{cu[4], cv[4]};
+        }
+}
+
 static void flow_dense(const std::vector<Img> &pa, const std::vector<Img> &pb, int W, int H,
                        std::vector<Vec2> &out, const std::vector<Vec2> *seed = nullptr,
                        int sbw = 0, int sbh = 0, int sB = 8) {
@@ -619,6 +639,12 @@ static void flow_dense(const std::vector<Img> &pa, const std::vector<Img> &pb, i
         for (int it = 0; it < g_fit; it++) {
             flow_level(pa[0], pb[0], fu, fv, 1, g_fal);
         }
+        if (g_vmed) {
+            std::vector<Vec2> tmp((size_t)W * H);
+            for (size_t i = 0; i < tmp.size(); i++) tmp[i] = Vec2{fu[i], fv[i]};
+            vmedian3(tmp, W, H);
+            for (size_t i = 0; i < tmp.size(); i++) { fu[i] = tmp[i].x; fv[i] = tmp[i].y; }
+        }
         out.assign((size_t)W * H, Vec2{0, 0});
         for (size_t i = 0; i < out.size(); i++) out[i] = Vec2{fu[i], fv[i]};
         return;
@@ -662,6 +688,7 @@ int main(int argc, char **argv) {
     if (const char *e = getenv("ALH_WIN")) g_win = atoi(e);
     if (const char *e = getenv("ALH_FIT")) g_fit = atoi(e);
     if (const char *e = getenv("ALH_FAL")) g_fal = (float)atof(e);
+    if (const char *e = getenv("ALH_VMED")) g_vmed = atoi(e);
     size_t ysz = (size_t)W * H, csz = (size_t)(W / 2) * (H / 2);
     size_t fsz = ysz + 2 * csz;
 

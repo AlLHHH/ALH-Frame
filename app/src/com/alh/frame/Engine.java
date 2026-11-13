@@ -118,10 +118,10 @@ public class Engine {
     /** 本次任务的完整轨迹，失败时整段给用户复制。 */
     final StringBuilder trace = new StringBuilder();
 
-    /** 引擎：0 = ALH Frame Lite（ffmpeg minterpolate），1 = ALH Frame Standard（自研内核）。 */
+    /** 引擎：0 = ALH Frame Lite（ffmpeg minterpolate），1 = ALH Frame Standard（自研块匹配），2 = ALH Frame Pro（低分辨率稠密流场）。 */
     static final int MODE_LITE = 0;
-    static final int MODE_PRO = 1;
-    static final int MODE_FLOW = 2;   // 普通版 v2：块匹配种子 + 稠密光流细化
+    static final int MODE_STD = 1;
+    static final int MODE_PRO = 2;
 
     int mode = MODE_LITE;
     /** 去重复帧：前后帧几乎一致时直接复制，不插值（Pro 内核支持）。 */
@@ -822,18 +822,22 @@ public class Engine {
             double ratio = outFps / srcFps;
             int nfr = Math.max(2, (int) Math.ceil(want * srcFps) + 1);
             int o = 49413 | 33554432 | 131072 | 262144;
-            if (mode == MODE_FLOW) o |= 8388608 | 4194304;  // 逐像素光流 + 逐块仲裁（遮挡边缘保锐度）
+            // Pro：流场在低分辨率上解，再逐像素与块场择优。场是连续逐像素的，没有方格，
+            // 解算尺度远小于画面，所以耗时约为标准档的一半。
+            if (mode == MODE_PRO) o = 4194304 | 268435456 | 262144;
             if (dedup) o |= 4096;
             final int opt = o;
             int f0 = (int) Math.round(tStart * outFps);
             String vf = "trim=end_frame=" + frames
                     + ",setpts=N/(" + fmt(outFps) + "*TB)+" + f0 + "/(" + fmt(outFps) + "*TB)";
+            int shortSide = Math.min(vw, vh);
+            String env = "ALH_OFRES=" + (shortSide >= 900 ? 400 : 250) + " ";
             StringBuilder sb = new StringBuilder();
             sb.append(q(ff)).append(" -hide_banner -nostdin -v error -ss ").append(ss)
                     .append(" -t ").append(fmt(want))
                     .append(" -i ").append(q(src.getAbsolutePath()))
                     .append(" -an -f rawvideo -pix_fmt yuv420p -");
-            sb.append(" | ").append(q(proBin)).append(" - ").append(vw).append(' ').append(vh)
+            sb.append(" | ").append(env).append(q(proBin)).append(" - ").append(vw).append(' ').append(vh)
                     .append(' ').append(nfr).append(" - ").append(fmt(ratio)).append(' ').append(opt);
             sb.append(" | ").append(q(ff))
                     .append(" -hide_banner -nostdin -v error -y -f rawvideo -pix_fmt yuv420p -s ")

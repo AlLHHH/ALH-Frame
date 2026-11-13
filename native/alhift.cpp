@@ -671,6 +671,197 @@ static void flow_dense(const std::vector<Img> &pa, const std::vector<Img> &pb, i
     }
 }
 
+
+// ===================== 变分光流：低分辨率 SOR 求解 + 双线性放大 =====================
+// 流场在短边 ~250px 的尺度上解（高清档 400），解完再放大回全分辨率。
+// 场本身是逐像素连续的，所以画面上不会有方格；低分辨率解算又让它在手机上够快。
+
+static int g_ofres = 250;
+static int g_hsout = 6;
+static int g_hsin = 12;
+static float g_hsa = 0.012f;   // 平滑项 alpha^2
+static int g_hsm = 0;           // 每次 SOR 后是否再做一次平滑（默认关，交给中值滤波）
+
+static void resize_area(const Img &s, Img &d, int nw, int nh) {
+    d.w = nw; d.h = nh; d.p.assign((size_t)nw * nh, 0);
+    float sx = (float)s.w / nw, sy = (float)s.h / nh;
+    for (int y = 0; y < nh; y++) {
+        int y0 = (int)(y * sy), y1 = std::min(s.h, (int)((y + 1) * sy));
+        if (y1 <= y0) y1 = std::min(s.h, y0 + 1);
+        for (int x = 0; x < nw; x++) {
+            int x0 = (int)(x * sx), x1 = std::min(s.w, (int)((x + 1) * sx));
+            if (x1 <= x0) x1 = std::min(s.w, x0 + 1);
+            int acc = 0, n = 0;
+            for (int yy = y0; yy < y1; yy++)
+                for (int xx = x0; xx < x1; xx++) { acc += s.row(yy)[xx]; n++; }
+            d.p[(size_t)y * nw + x] = (uint8_t)(n ? acc / n : 0);
+        }
+    }
+}
+
+static vector<Vec2> upsample_scaled(const vector<Vec2> &v, int bw, int bh, int nw, int nh, float mag) {
+    vector<Vec2> o((size_t)nw * nh, Vec2{0, 0});
+    for (int y = 0; y < nh; y++) {
+        float fy = ((y + 0.5f) * bh / nh) - 0.5f;
+        int y0 = std::max(0, std::min(bh - 1, (int)floorf(fy)));
+        int y1 = std::min(bh - 1, y0 + 1);
+        float ay = std::max(0.f, std::min(1.f, fy - y0));
+        for (int x = 0; x < nw; x++) {
+            float fx = ((x + 0.5f) * bw / nw) - 0.5f;
+            int x0 = std::max(0, std::min(bw - 1, (int)floorf(fx)));
+            int x1 = std::min(bw - 1, x0 + 1);
+            float ax = std::max(0.f, std::min(1.f, fx - x0));
+            Vec2 v00 = v[(size_t)y0 * bw + x0], v01 = v[(size_t)y0 * bw + x1];
+            Vec2 v10 = v[(size_t)y1 * bw + x0], v11 = v[(size_t)y1 * bw + x1];
+            float ux = (v00.x * (1 - ax) + v01.x * ax) * (1 - ay) + (v10.x * (1 - ax) + v11.x * ax) * ay;
+            float uy = (v00.y * (1 - ax) + v01.y * ax) * (1 - ay) + (v10.y * (1 - ax) + v11.y * ax) * ay;
+            o[(size_t)y * nw + x] = Vec2{ux * mag, uy * mag};
+        }
+    }
+    return o;
+}
+
+// 一次 warp + 导数 + SOR 松弛；u/v 是绝对位移（像素）
+static void hs_sor(const Img &a, const Img &b, std::vector<float> &u, std::vector<float> &v,
+                   int inner, float alpha2, float omega) {
+    const int w = a.w, h = a.h;
+    std::vector<float> Ix((size_t)w * h), Iy((size_t)w * h), It((size_t)w * h);
+    for (int y = 0; y < h; y++) {
+        for (int x = 0; x < w; x++) {
+            size_t i = (size_t)y * w + x;
+            float av = a.row(y)[x];
+            float bx = x + u[i], by = y + v[i];
+            float bv = bilin(b, bx, by);
+            float gxa = 0.5f * (bilin(a, x + 1.0f, (float)y) - bilin(a, x - 1.0f, (float)y));
+            float gya = 0.5f * (bilin(a, (float)x, y + 1.0f) - bilin(a, (float)x, y - 1.0f));
+            float gxb = 0.5f * (bilin(b, bx + 1.0f, by) - bilin(b, bx - 1.0f, by));
+            float gyb = 0.5f * (bilin(b, bx, by + 1.0f) - bilin(b, bx, by - 1.0f));
+            Ix[i] = 0.5f * (gxa + gxb);
+            Iy[i] = 0.5f * (gya + gyb);
+            It[i] = bv - av;   // 线性化 b(x+u) = a(x)：Ix*u + (b-a) = 0
+        }
+    }
+    for (int it = 0; it < inner; it++) {
+        for (int y = 0; y < h; y++) {
+            for (int x = 0; x < w; x++) {
+                size_t i = (size_t)y * w + x;
+                float us = 0, vs = 0; int n = 0;
+                if (x > 0) { us += u[i - 1]; vs += v[i - 1]; n++; }
+                if (x + 1 < w) { us += u[i + 1]; vs += v[i + 1]; n++; }
+                if (y > 0) { us += u[i - w]; vs += v[i - w]; n++; }
+                if (y + 1 < h) { us += u[i + w]; vs += v[i + w]; n++; }
+                if (!n) continue;
+                float ub = us / n, vb = vs / n;
+                float d = Ix[i] * ub + Iy[i] * vb + It[i];
+                float den = alpha2 + Ix[i] * Ix[i] + Iy[i] * Iy[i];
+                float nu = ub - Ix[i] * d / den;
+                float nv = vb - Iy[i] * d / den;
+                u[i] += omega * (nu - u[i]);
+                v[i] += omega * (nv - v[i]);
+                if (u[i] > 24.f) u[i] = 24.f;
+                if (u[i] < -24.f) u[i] = -24.f;
+                if (v[i] > 24.f) v[i] = 24.f;
+                if (v[i] < -24.f) v[i] = -24.f;
+            }
+        }
+        if (g_hsm) { gsmooth(u, w, h); gsmooth(v, w, h); }
+    }
+}
+
+
+// 低分辨率逐像素光流：把两帧缩到短边 ~g_ofres，在那一层跑逐像素 Gauss-Newton 金字塔，
+// 解完再双线性放大回全分辨率。流场尺度远小于画面，是这个方案能在手机上跑住的原因；
+// 放大后的场仍是逐像素连续的，画面上不会出现方格。
+
+// 两候选逐像素择优：块场在纹理上准，稠密场在弱纹理/大位移上稳。
+// 每个像素用对称残差选一个，不做整块回退，所以画面上不会出现方格。
+static void blend_candidates(const Img &a, const Img &b, int W, int H,
+                     std::vector<Vec2> &dense,
+                     const std::vector<Vec2> &blk, int bw, int bh, int sB) {
+    std::vector<Vec2> out((size_t)W * H);
+    const float t = 0.5f;
+    for (int y = 0; y < H; y++) {
+        for (int x = 0; x < W; x++) {
+            size_t i = (size_t)y * W + x;
+            Vec2 vd = dense[i];
+            Vec2 vb = sample_vec_b(blk, bw, bh, sB, (float)x, (float)y);
+            float cd = fabsf(bilin(a, x - vd.x * t, y - vd.y * t) - bilin(b, x + vd.x * (1 - t), y + vd.y * (1 - t)));
+            float cb = fabsf(bilin(a, x - vb.x * t, y - vb.y * t) - bilin(b, x + vb.x * (1 - t), y + vb.y * (1 - t)));
+            out[i] = (cb < cd) ? vb : vd;
+        }
+    }
+    dense.swap(out);
+}
+
+static void flow_gn_lowres(const Img &A, const Img &B, std::vector<Vec2> &out) {
+    float sc = (float)g_ofres / (float)std::max(1, std::min(A.w, A.h));
+    if (sc > 1.f) sc = 1.f;
+    int tw = std::max(24, (int)(A.w * sc)), th = std::max(24, (int)(A.h * sc));
+    std::vector<Img> qa(LEVELS), qb(LEVELS);
+    resize_area(A, qa[0], tw, th);
+    resize_area(B, qb[0], tw, th);
+    for (int l = 1; l < LEVELS; l++) { down2(qa[l - 1], qa[l]); down2(qb[l - 1], qb[l]); }
+    std::vector<Vec2> small;
+    flow_dense(qa, qb, tw, th, small, nullptr, 0, 0, 8);
+    if ((int)small.size() != tw * th) small.assign((size_t)tw * th, Vec2{0, 0});
+    float mag = (float)A.w / (float)tw;
+    out = upsample_scaled(small, tw, th, A.w, A.h, mag);
+}
+
+static void flow_hs(const Img &A, const Img &B, std::vector<Vec2> &out) {
+    float sc = (float)g_ofres / (float)std::max(1, std::min(A.w, A.h));
+    if (sc > 1.f) sc = 1.f;
+    int tw = std::max(16, (int)(A.w * sc)), th = std::max(16, (int)(A.h * sc));
+    Img a, b;
+    resize_area(A, a, tw, th);
+    resize_area(B, b, tw, th);
+
+    std::vector<Img> pa, pb;
+    pa.push_back(a); pb.push_back(b);
+    while ((int)pa.size() < 6 && std::min(pa.back().w, pa.back().h) > 40) {
+        Img na, nb;
+        down2(pa.back(), na); down2(pb.back(), nb);
+        pa.push_back(na); pb.push_back(nb);
+    }
+    vector<Vec2> field;
+    int pw = 0, ph = 0;
+    for (int l = (int)pa.size() - 1; l >= 0; l--) {
+        int w = pa[l].w, h = pa[l].h;
+        vector<Vec2> init((size_t)w * h, Vec2{0, 0});
+        if (pw && ph) init = upsample_scaled(field, pw, ph, w, h, 2.0f);
+        std::vector<float> u((size_t)w * h), v((size_t)w * h);
+        for (size_t i = 0; i < u.size(); i++) { u[i] = init[i].x; v[i] = init[i].y; }
+        for (int o = 0; o < g_hsout; o++) {
+            hs_sor(pa[l], pb[l], u, v, g_hsin, g_hsa, 1.6f);
+            vector<Vec2> tmp((size_t)w * h);
+            for (size_t i = 0; i < tmp.size(); i++) tmp[i] = Vec2{u[i], v[i]};
+            median3(tmp, w, h);
+            for (size_t i = 0; i < tmp.size(); i++) { u[i] = tmp[i].x; v[i] = tmp[i].y; }
+        }
+        field.resize((size_t)w * h);
+        for (size_t i = 0; i < field.size(); i++) field[i] = Vec2{u[i], v[i]};
+        pw = w; ph = h;
+    }
+    {
+        // 诊断：带流 warp 后的残差 vs 不带流
+        double r0 = 0, r1 = 0; long cnt = 0;
+        for (int y = 1; y + 1 < a.h; y++)
+            for (int x = 1; x + 1 < a.w; x++) {
+                size_t i = (size_t)y * a.w + x;
+                float ax = a.row(y)[x];
+                r0 += fabs(ax - (float)b.row(y)[x]);
+                r1 += fabs(ax - bilin(b, x + field[i].x, y + field[i].y));
+                cnt++;
+            }
+        if (cnt) fprintf(stderr, "hs resid noflow=%.2f withflow=%.2f\n", r0 / cnt, r1 / cnt);
+        double su = 0, sv = 0, sa = 0;
+        for (auto &q : field) { su += fabs(q.x); sv += fabs(q.y); sa += sqrt(q.x * q.x + q.y * q.y); }
+        double n = field.empty() ? 1 : (double)field.size();
+        fprintf(stderr, "hs field %dx%d mean|u|=%.3f mean|v|=%.3f mean|f|=%.3f\n", tw, th, su / n, sv / n, sa / n);
+    }
+    out = upsample_scaled(field, tw, th, A.w, A.h, 1.0f);
+}
+
 int main(int argc, char **argv) {
     if (argc < 6) {
         fprintf(stderr, "usage: alhift in.yuv W H N out.yuv [mult]\n");
@@ -689,6 +880,11 @@ int main(int argc, char **argv) {
     if (const char *e = getenv("ALH_FIT")) g_fit = atoi(e);
     if (const char *e = getenv("ALH_FAL")) g_fal = (float)atof(e);
     if (const char *e = getenv("ALH_VMED")) g_vmed = atoi(e);
+    if (const char *e = getenv("ALH_OFRES")) g_ofres = atoi(e);
+    if (const char *e = getenv("ALH_HSOUT")) g_hsout = atoi(e);
+    if (const char *e = getenv("ALH_HSIN")) g_hsin = atoi(e);
+    if (const char *e = getenv("ALH_HSA")) g_hsa = (float)atof(e);
+    if (const char *e = getenv("ALH_HSM")) g_hsm = atoi(e);
     size_t ysz = (size_t)W * H, csz = (size_t)(W / 2) * (H / 2);
     size_t fsz = ysz + 2 * csz;
 
@@ -799,7 +995,25 @@ int main(int argc, char **argv) {
         int nbw = 0, nbh = 0;
         vector<Vec2> cur;
         vector<Vec2> gfield; int gw = 0, gh = 0;
-        if (opt & 8388608) {
+        if (opt & 4194304) {
+            // 低分辨率逐像素光流：整幅场在 ~250px 上解，再放大回全分辨率
+            flow_gn_lowres(pa[0], pb[0], cur);
+            flow_gn_lowres(pb[0], pa[0], gfield);
+            nbw = W; nbh = H; gw = W; gh = H;
+            if (opt & 268435456) {
+                vector<Vec2> blk, blkb; int bkw = 0, bkh = 0, bkw2 = 0, bkh2 = 0;
+                mkfield(pa, pb, blk, bkw, bkh);
+                mkfield(pb, pa, blkb, bkw2, bkh2);
+                blend_candidates(pa[0], pb[0], W, H, cur, blk, bkw, bkh, 8);
+                blend_candidates(pb[0], pa[0], W, H, gfield, blkb, bkw2, bkh2, 8);
+            }
+        } else if (opt & 1073741824) {
+            // 变分光流路线：低分辨率 SOR 求解，放大回全分辨率
+            flow_hs(pa[0], pb[0], cur);
+            flow_hs(pb[0], pa[0], gfield);
+            nbw = W; nbh = H; gw = W; gh = H;
+            fprintf(stderr, "k=%d flow vari\n", k);
+        } else if (opt & 8388608) {
             // 稠密光流路线：块匹配给大位移种子，稠密迭代把场拉连续、补到亚像素
             mkfield(pa, pb, cur, nbw, nbh);
             mkfield(pb, pa, gfield, gw, gh);
@@ -844,7 +1058,7 @@ int main(int argc, char **argv) {
             cur = res; nbw = rw; nbh = rh;
         }
         fprintf(stderr, "k=%d match done %dx%d\n", k, nbw, nbh);
-        int B = (opt & 8388608) ? 1 : ((opt & 8) ? 4 : 8), bw = nbw, bh = nbh;
+        int B = (opt & (8388608 | 1073741824 | 4194304)) ? 1 : ((opt & 8) ? 4 : 8), bw = nbw, bh = nbh;
         if (B > 1) median3(cur, bw, bh);
         if (opt & 16) { median3(cur, bw, bh); median3(cur, bw, bh); }   // 多遍中值：压块状拼布
         if (B > 1) {

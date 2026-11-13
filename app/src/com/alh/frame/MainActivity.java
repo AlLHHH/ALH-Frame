@@ -465,7 +465,7 @@ public class MainActivity extends Activity {
 
     // ------------------------------------------------------------------ 流程
 
-    static final String[] ENGINE_NAMES = {"ALH Frame Lite", "ALH Frame Standard", "ALH Frame Standard v2"};
+    static final String[] ENGINE_NAMES = {"ALH Frame Lite", "ALH Frame Standard", "ALH Frame Pro"};
 
     // 自绘下拉：黑卡片 + 两行选项，避系统弹出的白边框
     private void showEngineMenu(View anchor) {
@@ -510,7 +510,7 @@ public class MainActivity extends Activity {
                     ? "基于 ffmpeg minterpolate：复杂运动更稳，推荐日常使用。"
                     : e == 1
                     ? "自研内核：块匹配，速度快，细节更锐。"
-                    : "自研内核 v2：块匹配种子 + 稠密光流细化，边缘更连续，细节略软，速度最慢。");
+                    : "自研内核 Pro：流场在低分辨率上解算再逐像素融合，边缘连续无方格，速度约为标准档的一半。");
         }
         if (btnDedup != null) {
             // 去重复帧是自研内核的开关，Lite 上不显示，免得看成对 ffmpeg 也能用

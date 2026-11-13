@@ -4,7 +4,7 @@
 
 24fps 的素材补到 48 / 72 / 96fps，30fps 的补到 60 / 90 / 120fps。1080p 的片子按 128 ms/输出帧算，十分钟的 2× 成品在八核手机上大约二十多分钟，具体看运动复杂度。
 
-- 包名 `com.alh.frame`，版本 1.1，minSdk 24，targetSdk 28
+- 包名 `com.alh.frame`，版本 1.2，minSdk 24，targetSdk 28
 - 单 Activity，无第三方 Java 依赖，界面是代码搭的
 - 引擎自带 ffmpeg 9.0.2，切成进程池并行跑，段编完立刻并合，不等全片
 
@@ -80,45 +80,48 @@ segments = max(workers, ceil(时长 / 30))
 
 10 秒、300 帧、6 段的 2× 测试：输出 600 帧、10.000 s、60/1 fps，音轨 10.000 s。另用 8 位条码在每帧里编上源帧号做逐帧校验，第 2k 个输出帧正好是源第 k 帧，中间没有漂移。
 
-## ALH Frame Standard 内核
+## 自研内核
 
-`app/assets/alh/alhift-<abi>` 是自己写的插帧器，单文件 C++17，不依赖任何推理框架。它跟 Lite 的区别是运动估计和合成全部自己实现：
-
-1. 2×2 盒采样建 3 到 4 层金字塔，每层做 8×8 块的 SAD 匹配，粗层搜索半径 8，往下逐层收窄到 2，最细层 3，两遍搜索，矢量幅度按 `0.02*(|dx|+|dy|)` 罚一下。
-2. 矢量场上采样后做 3×3 分量中值，去掉孤立错矢量。
-3. 按保留下来的匹配代价算置信度 `c = 1/(1+meanSAD²/900)`，合成时 `p0 = 双线性(a, x-vt)`、`p1 = 双线性(b, x+v(1-t))`，权重 `w0 = (1-t)(0.35+0.65c)`、`w1 = t(0.35+0.65c)`。
-4. 去重复帧：相邻帧按 4 像素采样算平均绝对差，小于 0.8 就判定重复，直接复制当前帧跳过一次估计。
-
-管线是 `ffmpeg 解码 → alhift → ffmpeg 编码`，三段用 `sh` 管道串起来，中间不落盘：
+`app/assets/alh/alhift-<abi>` 是自带的插帧器，单文件 C++17，不依赖推理框架。管线不落盘，三段用 `sh` 管道串起来：
 
 ```
 ffmpeg -ss .. -t .. -i src -an -f rawvideo -pix_fmt yuv420p -
-  | alhift - W H N - 2 4
-  | ffmpeg -f rawvideo -s WxH -r <输出帧率> -i - -c:v libx264 ... -f mpegts out.ts
+  | alhift - W H N - <倍率> <选项>
+  | ffmpeg -f rawvideo -pix_fmt yuv420p -s WxH -r <输出帧率> -i -
+      -vf trim=end_frame=..,setpts=N/(fps*TB)+F0/(fps*TB)
+      -c:v libx264 -f mpegts -bf 0 out.ts
 ```
 
-实测（720×1280 与 360×640 合成真值，只算插帧不算编解码）：
+同一份内核出两档，下拉里对应 `ALH Frame Standard` 与 `ALH Frame Pro`。
 
-| 素材 | 做法 | SSIM | PSNR | 耗时 |
-| --- | --- | --- | --- | --- |
-| 360×640 | Pro | 0.9907 | 39.79 | 0.55 s |
-| 360×640 | Lite | 0.9864 | 36.01 | 1.03 s |
-| 1280×720 | Pro | 0.9837 | 40.58 | 2.07 s |
-| 1280×720 | Lite | 0.9864 | 43.62 | 2.30 s |
+### Standard：块匹配
 
-单文件 C++17，可以直接拿去当命令行工具用，接口与编译方式见 [native/README.md](native/README.md)。
+1. 2×2 盒采样建 3 到 4 层金字塔，每层做 8×8 块匹配，粗层搜索半径 8，往下收到 2，最细层 8，两遍搜索。
+2. 代价用块外扩 2 像素的重叠窗 SAD 归一化，再加 `pen × (|dx|+|dy|)` 的矢量幅度惩罚；`pen` 按首帧的噪声水平自动定，噪点重罚会让场退回零矢量，画面反而更糊。
+3. 场上采样后做 3×3 分量中值，去掉孤立错矢量；合成按匹配代价算可信度，`p0/p1` 双向双线性取点后加权。
+4. 场景切换按帧间平均差判定，硬切处直接复制当前帧，不强行插过渡。
+5. 去重复帧：相邻帧按 4 像素采样算平均绝对差，小于 0.8 判为重复，直接复制当前帧，跳过一次估计。
 
-低分辨率下 Pro 领先约 3.8 dB，速度还快一倍；720p 上还差 Lite 约 3 dB，差距集中在运动区的矢量精度（运动区平均误差 3.64 对 1.86，静止区反而更好：0.67 对 0.84）。试过双向场、多假设、4×4 精修、16px 块、更大搜索半径，全部没有正收益，所以这一版把 Pro 定位成「低分辨率与老片更清楚、更快」，高分辨率继续用 Lite。Pro 某一段跑不动时会自动退到 Lite 出片，不让任务整体失败。
+### Pro：低分辨率稠密流
 
-### 第三档：Standard v2（逐像素光流）
+运动场不在全分辨率上逐块解，而是先把两帧缩到短边 250（短边 ≥900 时用 400），在那一层跑逐像素 Gauss-Newton 迭代（每轮 [1 2 1] 平滑）求连续流场，再放大回全分辨率；块匹配的结果同时留一份作为候选，每个像素按两端残差挑更准的那个。场是逐像素连续的，没有"一块一个矢量"的方格。
 
-同一份内核里的第二条路线：块匹配只用来提供低分辨率的初始场，全分辨率上换成逐像素光流迭代（Gauss-Newton，每轮带 [1 2 1] 平滑），合成时每个像素用自己的亚像素矢量，不存在"一块一个矢量"的方格。
+耗时主要在解流场的尺度上，所以画面越大越省：720p 一对比 Standard 快约一成到三成，1080p 以上差距更明显。画质与 Standard 基本持平，纹理极稀疏处会略软。
 
-| 素材 | Standard | Standard v2 | Lite | 耗时 v2 / Standard |
-| --- | --- | --- | --- | --- |
-| foreman 352×288 实拍 15→30 | 0.9497 | 0.9441 | 0.9486 | 4.6 s / 2.1 s |
+单独当命令行工具用的接口见 [native/README.md](native/README.md)。
 
-v2 的场是连续的，所以慢推镜头和大面积渐变上更顺；代价是纹理稀疏处矢量会被光流拉平，细节比 Standard 软，SSIM 也低一点。之前那一版 v2 把块匹配的整块矢量写回全分辨率，画面上就是一片方格，这个做法已经删掉。
+### 实测
+
+真值素材上只算插值帧（不含复制帧），模拟器 x86_64：
+
+| 素材 | Lite | Standard | Pro |
+| --- | --- | --- | --- |
+| foreman 352×288 实拍 15→30 | 0.9486 | 0.9497 | 0.9452 |
+| 720p 合成 30→60 | 0.9864 | 0.9812 | 0.9829 |
+
+Lite 在 720p 上的分数看着高，是因为合成素材的运动比较规整；换到实拍片，块匹配和稠密流的稳定性明显更好。低分辨率（短边 360 以下）Lite 会退化成两帧对半混合，这一档选 Standard 或 Pro。
+
+Pro 某一段跑不动时会自动退到 Standard 出片，不让任务整体失败。
 
 ## 功能
 
@@ -130,7 +133,7 @@ v2 的场是连续的，所以慢推镜头和大面积渐变上更顺；代价�
 | 输出 | `Movies/ALH Frame/ALHFrame_<时间戳>_<倍率>x.mp4`，H.264 High，CRF 19，yuv420p，`+faststart` |
 | 进度 | 逐帧显示「第 N / 总数 帧」，多路并发时按已完成帧数累计 |
 | 日志 | 右上角「日志」，滚动保留最近 5 MB，可复制、可清空 |
-| 引擎 | `ALH Frame Lite` 走 ffmpeg `minterpolate`；`ALH Frame Standard` 走自研块匹配内核；`ALH Frame Standard v2` 是同一内核的稠密光流档（见下节）|
+| 引擎 | `ALH Frame Lite` 走 ffmpeg `minterpolate`；`ALH Frame Standard` 走自研块匹配内核；`ALH Frame Pro` 走低分辨率稠密流场（见「自研内核」）|
 | 去重复帧 | 仅 Pro 可用。相邻帧 luma 采样差 < 0.8 判为重复，直接复制当前帧，省掉一次运动估计 |
 
 ## 构建
@@ -138,7 +141,7 @@ v2 的场是连续的，所以慢推镜头和大面积渐变上更顺；代价�
 不用 Gradle，链路是 `aapt2 → javac → d8 → zipalign → apksigner`：
 
 ```bash
-./build.sh          # 产物：build/ALHFrame-1.1.apk
+./build.sh          # 产物：build/ALHFrame-1.2.apk
 ```
 
 依赖都在 `tools/`：JDK 21、Android SDK build-tools 35.0.0、platforms/android-33。中间文件写 `build/.tmp`，脚本结束自动清掉，`build/` 里只留签名好的 APK。
@@ -169,13 +172,13 @@ native/alhift.cpp                 自研内核源码，可独立编译使用（�
 docs/算法说明.md                  管线、参数、耗时拆解
 docs/THIRD-PARTY.md               第三方组件与许可
 tools/                            图标、界面预览的生成脚本
-build/ALHFrame-1.1.apk
+build/ALHFrame-1.2.apk
 ```
 
 ## 安装
 
 ```bash
-adb install -r build/ALHFrame-1.1.apk
+adb install -r build/ALHFrame-1.2.apk
 ```
 
 签名证书 SHA-256 是 `0c38ea…`，与任何旧版本都不同，装之前先卸载旧包，否则报 `INSTALL_FAILED_UPDATE_INCOMPATIBLE`。
@@ -220,13 +223,11 @@ python tools/make_ui_mock.py         # 界面版式预览（需要 Pillow）
 - 源文件会复制一份到私有缓存，大文件多占一份空间。
 - VFR 源按平均帧率处理，时长有极小偏差。
 - 4× 之后输出帧率部分机型相册不认，比如 30fps × 4 = 120fps，播放器会按 60 播。
-- 手写光流替代 `minterpolate` 试过一版，720p 每插值帧 83 ms，SSIM 0.9735，打不过 mci 的 0.9883，暂时搁置。
-- 720p 以上 Pro 的锐度还不如 Lite（差约 3 dB），高分辨率建议用 Lite。
 - x86_64 模拟器上引擎跑不起来：APK 里只有一个 arm64 的 ffmpeg。要在模拟器里验证，得自己换一份同版本的 x86_64 二进制。
 
 ## 许可与第三方
 
-Java 代码 Apache-2.0，见 [LICENSE](LICENSE)。内置的 ffmpeg 是 GPLv3（`--enable-gpl --enable-version3` 加 libx264/libx265），以独立进程方式调用，源码可直接下载：[ffmpeg-9.0.2-source.tar.xz](https://github.com/AlLHHH/ALH-Frame/releases/download/v1.0.0/ffmpeg-9.0.2-source.tar.xz)（12 MB，与官方 tarball 字节一致）。重建步骤、完整 configure 行、各外部库许可证见 [docs/BUILD-SOURCE.md](docs/BUILD-SOURCE.md) 和 [docs/THIRD-PARTY.md](docs/THIRD-PARTY.md)。
+Java 代码 Apache-2.0，见 [LICENSE](LICENSE)。内置的 ffmpeg 是 GPLv3（`--enable-gpl --enable-version3` 加 libx264/libx265），以独立进程方式调用，源码可直接下载：[ffmpeg-9.0.2-source.tar.xz](https://github.com/AlLHHH/ALH-Frame/releases/download/v1.1.0/ffmpeg-9.0.2-source.tar.xz)（12 MB，与官方 tarball 字节一致）。重建步骤、完整 configure 行、各外部库许可证见 [docs/BUILD-SOURCE.md](docs/BUILD-SOURCE.md) 和 [docs/THIRD-PARTY.md](docs/THIRD-PARTY.md)。
 
 ## 关键词
 

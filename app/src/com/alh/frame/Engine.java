@@ -822,7 +822,7 @@ public class Engine {
             double ratio = outFps / srcFps;
             int nfr = Math.max(2, (int) Math.ceil(want * srcFps) + 1);
             int o = 49413 | 33554432 | 131072 | 262144;
-            if (mode == MODE_FLOW) o |= 8388608;            // 逐像素光流档
+            if (mode == MODE_FLOW) o |= 8388608 | 4194304;  // 逐像素光流 + 逐块仲裁（遮挡边缘保锐度）
             if (dedup) o |= 4096;
             final int opt = o;
             int f0 = (int) Math.round(tStart * outFps);

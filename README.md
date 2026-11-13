@@ -4,7 +4,7 @@
 
 24fps 的素材补到 48 / 72 / 96fps，30fps 的补到 60 / 90 / 120fps。1080p 的片子按 128 ms/输出帧算，十分钟的 2× 成品在八核手机上大约二十多分钟，具体看运动复杂度。
 
-- 包名 `com.alh.frame`，版本 1.0，minSdk 24，targetSdk 28
+- 包名 `com.alh.frame`，版本 1.1，minSdk 24，targetSdk 28
 - 单 Activity，无第三方 Java 依赖，界面是代码搭的
 - 引擎自带 ffmpeg 9.0.2，切成进程池并行跑，段编完立刻并合，不等全片
 
@@ -138,7 +138,7 @@ ffmpeg -ss .. -t .. -i src -an -f rawvideo -pix_fmt yuv420p -
 不用 Gradle，链路是 `aapt2 → javac → d8 → zipalign → apksigner`：
 
 ```bash
-./build.sh          # 产物：build/ALHFrame-1.0.apk
+./build.sh          # 产物：build/ALHFrame-1.1.apk
 ```
 
 依赖都在 `tools/`：JDK 21、Android SDK build-tools 35.0.0、platforms/android-33。中间文件写 `build/.tmp`，脚本结束自动清掉，`build/` 里只留签名好的 APK。
@@ -169,13 +169,13 @@ native/alhift.cpp                 自研内核源码，可独立编译使用（�
 docs/算法说明.md                  管线、参数、耗时拆解
 docs/THIRD-PARTY.md               第三方组件与许可
 tools/                            图标、界面预览的生成脚本
-build/ALHFrame-1.0.apk
+build/ALHFrame-1.1.apk
 ```
 
 ## 安装
 
 ```bash
-adb install -r build/ALHFrame-1.0.apk
+adb install -r build/ALHFrame-1.1.apk
 ```
 
 签名证书 SHA-256 是 `0c38ea…`，与任何旧版本都不同，装之前先卸载旧包，否则报 `INSTALL_FAILED_UPDATE_INCOMPATIBLE`。

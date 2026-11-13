@@ -52,6 +52,10 @@ static int g_dpe = 0;         // DIS 最细层额外 patch 遍数（P=8/step=2/m
 static int g_gnref = 0;       // after low-res solve: extra full-res GN rounds (0 = none)
 static float g_gna = 1.0f;    // alpha2 for those rounds (smaller = sharper)
 static int g_gns = 0;         // [1 2 1] smoothing passes before those rounds
+static int g_jbu = 0;         // 1 = 矢量上采样走边缘引导（joint bilateral）
+static int g_iter = 1;        // 块匹配整体重复次数（第二轮用上一轮场做初值）
+static int g_bicu = 0;        // 1 = 合成采样用 Catmull-Rom，抵消亚像素 warp 的糊
+static float g_jbus = 1.0f / 144.0f;  // 灰度差权重：sigma = 12 灰阶
 static float g_dupThr = -1.f; // 去重阈值：按噪声自动定，<0 表示还没算
 static int g_lv = 6;          // 稠密光流金字塔最大层数（调参用）
 static int g_lvmed = 1;       // 层间矢量场上采样后做 3x3 分量中值（1=开）
@@ -207,6 +211,35 @@ static inline Vec2 sample_vec_b(const vector<Vec2> &v, int bw, int bh, int B, in
     r.x = (p00.x * (1 - ax) + p10.x * ax) * (1 - ay) + (p01.x * (1 - ax) + p11.x * ax) * ay;
     r.y = (p00.y * (1 - ax) + p10.y * ax) * (1 - ay) + (p01.y * (1 - ax) + p11.y * ax) * ay;
     return r;
+}
+
+// 边缘引导的矢量上采样（joint bilateral upsampling）：
+// 用当前帧 luma 做引导，块矢量的权重按「空间双线性 × 灰度差高斯」衰减，
+// 于是同一个块内的矢量会向灰度相近的那一侧偏，块边界不再一刀切。
+static inline Vec2 sample_vec_jbu(const vector<Vec2> &v, int bw, int bh, int B,
+                                  const Img &guide, float x, float y, float sig2) {
+    if (bw <= 0 || bh <= 0) return Vec2{0.f, 0.f};
+    float fx = x / B - 0.5f, fy = y / B - 0.5f;
+    int x0 = (int)floorf(fx), y0 = (int)floorf(fy);
+    float ax = fx - x0, ay = fy - y0;
+    int gx = std::min(guide.w - 1, std::max(0, (int)lroundf(x)));
+    int gy = std::min(guide.h - 1, std::max(0, (int)lroundf(y)));
+    float g0 = (float)guide.row(gy)[gx];
+    float sw = 0.f, su = 0.f, sv = 0.f;
+    for (int j = 0; j < 2; j++) {
+        for (int i = 0; i < 2; i++) {
+            int bx = std::min(bw - 1, std::max(0, x0 + i));
+            int by = std::min(bh - 1, std::max(0, y0 + j));
+            float ws = (i ? ax : 1.f - ax) * (j ? ay : 1.f - ay);
+            int px = std::min(guide.w - 1, std::max(0, bx * B + B / 2));
+            int py = std::min(guide.h - 1, std::max(0, by * B + B / 2));
+            float d = (float)guide.row(py)[px] - g0;
+            float w = ws * expf(-d * d * sig2) + 1e-5f;
+            const Vec2 &c = v[(size_t)by * bw + bx];
+            su += c.x * w; sv += c.y * w; sw += w;
+        }
+    }
+    return Vec2{su / sw, sv / sw};
 }
 
 // Catmull-Rom 三次卷积采样：光流档合成用，抵消亚像素 warp 带来的糊。
@@ -1163,6 +1196,9 @@ int main(int argc, char **argv) {
     if (const char *e = getenv("ALH_GNREF")) g_gnref = atoi(e);
     if (const char *e = getenv("ALH_GNA")) g_gna = (float)atof(e);
     if (const char *e = getenv("ALH_GNS")) g_gns = atoi(e);
+    if (const char *e = getenv("ALH_JBU")) g_jbu = atoi(e);
+    if (const char *e = getenv("ALH_ITER")) g_iter = atoi(e);
+    if (const char *e = getenv("ALH_BICU")) g_bicu = atoi(e);
     if (const char *e = getenv("ALH_HSOUT")) g_hsout = atoi(e);
     if (const char *e = getenv("ALH_HSIN")) g_hsin = atoi(e);
     if (const char *e = getenv("ALH_HSA")) g_hsa = (float)atof(e);
@@ -1269,10 +1305,12 @@ int main(int argc, char **argv) {
         // 粗到细块匹配（可双向：A→B 与 B→A）
         auto mkfield = [&](vector<Img> &A, vector<Img> &Bs, vector<Vec2> &out, int &ow, int &oh) {
             vector<Vec2> c2; int cw = 0, ch = 0;
+            for (int rep = 0; rep < std::max(1, g_iter); rep++)
             for (int l = LEVELS - 1; l >= 0; l--) {
                 int Bb = 8;
                 int rad = (l == LEVELS - 1) ? 8 : 2;
                 if (l == 0) rad = (opt & 134217728) ? 16 : ((opt & 67108864) ? 12 : ((opt & 33554432) ? 8 : ((opt & 32) ? 6 : 3)));
+                if (rep > 0) rad = 2;   // 第二轮场已经很接近，只需小半径收尾
                 int tw = (A[l].w + Bb - 1) / Bb, th = (A[l].h + Bb - 1) / Bb;
                 vector<Vec2> init;
                 if (c2.empty()) init.assign((size_t)tw * th, Vec2{0, 0});
@@ -1348,6 +1386,25 @@ int main(int argc, char **argv) {
             }
             nbw = W; nbh = H;
             fprintf(stderr, "k=%d flow dense\n", k);
+        } else if (opt & 2048) {
+            // 块场细化：块匹配先定大位移，再把块矢量双线性铺到每个像素，
+            // 用全分辨率 GN 迭代几轮把场抹平、补到亚像素——精度来自块匹配，
+            // 连续性来自逐像素细化，块边界不会一格一格地跳。
+            mkfield(pa, pb, cur, nbw, nbh);
+            mkfield(pb, pa, gfield, gw, gh);
+            std::vector<float> fu((size_t)W * H), fv((size_t)W * H);
+            for (int y = 0; y < H; y++) {
+                for (int x = 0; x < W; x++) {
+                    Vec2 s = sample_vec_b(cur, nbw, nbh, 8, (float)x, (float)y);
+                    size_t i = (size_t)y * W + x;
+                    fu[i] = s.x; fv[i] = s.y;
+                }
+            }
+            for (int it = 0; it < g_gns; it++) gsmooth(fu, W, H), gsmooth(fv, W, H);
+            for (int it = 0; it < g_gnref; it++) flow_level(pa[0], pb[0], fu, fv, 1, g_gna);
+            cur.resize((size_t)W * H);
+            for (size_t i = 0; i < fu.size(); i++) cur[i] = Vec2{fu[i], fv[i]};
+            nbw = W; nbh = H;
         } else {
             mkfield(pa, pb, cur, nbw, nbh);
             // 反向场始终要算：合成阶段用它做双向一致性校验，遮挡区才不会糊成重影
@@ -1363,7 +1420,7 @@ int main(int argc, char **argv) {
             cur = res; nbw = rw; nbh = rh;
         }
         fprintf(stderr, "k=%d match done %dx%d\n", k, nbw, nbh);
-        int B = (opt & (8388608 | 1073741824 | 4194304)) ? 1 : ((opt & 8) ? 4 : 8), bw = nbw, bh = nbh;
+        int B = (opt & (8388608 | 1073741824 | 4194304 | 2048)) ? 1 : ((opt & 8) ? 4 : 8), bw = nbw, bh = nbh;
         if (B > 1) median3(cur, bw, bh);
         if (opt & 16) { median3(cur, bw, bh); median3(cur, bw, bh); }   // 多遍中值：压块状拼布
         if (B > 1) {
@@ -1444,8 +1501,8 @@ int main(int argc, char **argv) {
                                     float rr = sqrtf(ex * ex + ey * ey);
                                     trust = 1.0f / (1.0f + rr * rr * 0.25f);
                                 }
-                                P0 += (opt & 1073741824 ? bicu(a, ax, ay) : bilin(a, ax, ay)) * wk;
-                                P1 += (opt & 1073741824 ? bicu(b, bxp, byp) : bilin(b, bxp, byp)) * wk * trust;
+                                P0 += ((opt & 1073741824) || g_bicu ? bicu(a, ax, ay) : bilin(a, ax, ay)) * wk;
+                                P1 += ((opt & 1073741824) || g_bicu ? bicu(b, bxp, byp) : bilin(b, bxp, byp)) * wk * trust;
                                 wsum += wk;
                                 w0s += wk;
                                 w1s += wk * trust;
@@ -1456,13 +1513,14 @@ int main(int argc, char **argv) {
                             P1 /= (w1s > 1e-4f ? w1s : wsum);
                         } else { wsum = 0.0f; }
                     } else {
-                        Vec2 v = (opt & 256) ? sample_vec_b(cur, bw, bh, B, x, y) : sample_vech(cur, bw, bh, B, x, y);
+                        Vec2 v = g_jbu ? sample_vec_jbu(cur, bw, bh, B, pa[0], (float)x, (float)y, g_jbus)
+                            : ((opt & 256) ? sample_vec_b(cur, bw, bh, B, x, y) : sample_vech(cur, bw, bh, B, x, y));
                         float ax = x - v.x * t, ay = y - v.y * t;
                         float bxp = x + v.x * (1 - t), byp = y + v.y * (1 - t);
                         bool i0 = ax >= 0 && ay >= 0 && ax <= W - 1 && ay <= H - 1;
                         bool i1 = bxp >= 0 && byp >= 0 && bxp <= W - 1 && byp <= H - 1;
                         if (i0 && i1) {
-                            if (opt & 1073741824) { P0 = bicu(a, ax, ay); P1 = bicu(b, bxp, byp); }
+                            if ((opt & 1073741824) || g_bicu) { P0 = bicu(a, ax, ay); P1 = bicu(b, bxp, byp); }
                             else { P0 = bilin(a, ax, ay); P1 = bilin(b, bxp, byp); }
                             wsum = 1.0f;
                         }
@@ -1561,7 +1619,8 @@ int main(int argc, char **argv) {
                         }
                         if (ws > 1e-4f) { u0 /= ws; u1 /= ws; v0 /= ws; v1 /= ws; }
                     } else {
-                        Vec2 v = (opt & 256) ? sample_vec_b(cur, bw, bh, B, x * 2, y * 2) : sample_vech(cur, bw, bh, B, x * 2, y * 2);
+                        Vec2 v = g_jbu ? sample_vec_jbu(cur, bw, bh, B, pa[0], (float)x * 2, (float)y * 2, g_jbus)
+                            : ((opt & 256) ? sample_vec_b(cur, bw, bh, B, x * 2, y * 2) : sample_vech(cur, bw, bh, B, x * 2, y * 2));
                         addTap(v, 1.0f);
                     }
                     ou[(size_t)y * hw + x] = (uint8_t)std::max(0, std::min(255, (int)lroundf(u0 * (1 - t) + u1 * t)));

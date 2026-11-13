@@ -4,7 +4,7 @@
 
 24fps 的素材补到 48 / 72 / 96fps，30fps 的补到 60 / 90 / 120fps。1080p 的片子按 128 ms/输出帧算，十分钟的 2× 成品在八核手机上大约二十多分钟，具体看运动复杂度。
 
-- 包名 `com.alh.frame`，版本 1.3，minSdk 24，targetSdk 28
+- 包名 `com.alh.frame`，版本 1.2，minSdk 24，targetSdk 28
 - 单 Activity，无第三方 Java 依赖，界面是代码搭的
 - 引擎自带 ffmpeg 9.0.2，切成进程池并行跑，段编完立刻并合，不等全片
 
@@ -134,6 +134,25 @@ Pro v2 换了一条完全不同的路子：不按块找匹配，逐像素解运�
 
 结论写在数据里：Pro v2 的场逐像素连续，没有方格，遮挡处不重影；但 SSIM 比块匹配低一档，720p 上也更慢。它是换路，不是免费升级。
 
+### 自检：这套流场到底是不是逐像素光流
+
+光看着像不算数，直接把它解出来的场导出来量。
+
+用已知位移的合成对（高斯模糊噪声纹理 320×240，`cv2.warpAffine` 做真亚像素平移）跑 `Pro v2`，`ALH_FLOWDUMP` 导出首对帧的逐像素 `(u,v)`：
+
+| 真值位移 | 恢复的 u | 恢复的 v | 平均误差 | 场标准差 | 非整数值占比 |
+| --- | --- | --- | --- | --- | --- |
+| (0.4, 0.3) | 0.422 | 0.345 | 0.066 px | 0.108 | 99.9% |
+| (1.6, −0.7) | 1.576 | −0.657 | 0.068 px | 0.109 | 99.9% |
+| (3.4, −1.8) | 3.424 | −1.748 | 0.076 px | 0.105 | 99.9% |
+| (−2.5, 4.1) | −2.503 | 4.139 | 0.042 px | 0.099 | 100% |
+| (7.3, 2.2) | 5.513 | 1.644 | 2.342 px | 1.628 | 89.1% |
+
+两个结论都在数据里：
+
+- 场是逐像素连续的：99.9% 的取值不是整数，相邻像素差约 0.06 px；按 8×8 切块算块内方差，占全图方差的 88%（块匹配会是接近 0 的整数阶跃）。
+- 短板是大位移：3.4 px 以内误差不到 0.08 px，到 7.3 px 就掉到 2.3 px。块匹配在全分辨率搜 ±8，这条链每轮只走 2 px，靠金字塔补，快速运动就容易欠估。
+
 单独当命令行工具用的接口见 [native/README.md](native/README.md)。
 
 ### 实测
@@ -167,7 +186,7 @@ Pro 某一段跑不动时会自动退到 Standard 出片，不让任务整体失
 不用 Gradle，链路是 `aapt2 → javac → d8 → zipalign → apksigner`：
 
 ```bash
-./build.sh          # 产物：build/ALHFrame-1.3.apk
+./build.sh          # 产物：build/ALHFrame-1.2.apk
 ```
 
 依赖都在 `tools/`：JDK 21、Android SDK build-tools 35.0.0、platforms/android-33。中间文件写 `build/.tmp`，脚本结束自动清掉，`build/` 里只留签名好的 APK。
@@ -198,13 +217,13 @@ native/alhift.cpp                 自研内核源码，可独立编译使用（�
 docs/算法说明.md                  管线、参数、耗时拆解
 docs/THIRD-PARTY.md               第三方组件与许可
 tools/                            图标、界面预览的生成脚本
-build/ALHFrame-1.3.apk
+build/ALHFrame-1.2.apk
 ```
 
 ## 安装
 
 ```bash
-adb install -r build/ALHFrame-1.3.apk
+adb install -r build/ALHFrame-1.2.apk
 ```
 
 签名证书 SHA-256 是 `0c38ea…`，与任何旧版本都不同，装之前先卸载旧包，否则报 `INSTALL_FAILED_UPDATE_INCOMPATIBLE`。

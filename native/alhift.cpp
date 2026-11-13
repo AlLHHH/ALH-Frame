@@ -393,6 +393,86 @@ static void flow_level(const Img &a, const Img &b, std::vector<float> &u, std::v
 }
 
 // 从 half 分辨率金字塔求场，再双线性放大到全分辨率；返回的场语义：b(x+u) ≈ a(x)
+// ---- 边缘感知的矢量场平滑（guided filter, He et al. 2010）----
+// 块匹配给出的是"一块一个矢量"，直接放大就是用户看到的像素块。经典做法是：
+// 先用双线性把低分辨率场放大，再用图像本身当引导做一次 guided filter，
+// 让矢量在平坦区被抹平、在物体边缘保持跳变。这一步是消除块状观感的关键。
+static void boxmean(const std::vector<float> &src, int w, int h, int r,
+                    std::vector<float> &dst) {
+    std::vector<double> ii((size_t)(w + 1) * (h + 1), 0.0);
+    for (int y = 0; y < h; y++) {
+        double rowsum = 0;
+        for (int x = 0; x < w; x++) {
+            rowsum += src[(size_t)y * w + x];
+            ii[(size_t)(y + 1) * (w + 1) + (x + 1)] = ii[(size_t)y * (w + 1) + (x + 1)] + rowsum;
+        }
+    }
+    dst.assign((size_t)w * h, 0.0f);
+    for (int y = 0; y < h; y++) {
+        int y0 = std::max(0, y - r), y1 = std::min(h - 1, y + r);
+        for (int x = 0; x < w; x++) {
+            int x0 = std::max(0, x - r), x1 = std::min(w - 1, x + r);
+            double s = ii[(size_t)(y1 + 1) * (w + 1) + (x1 + 1)] - ii[(size_t)y0 * (w + 1) + (x1 + 1)]
+                     - ii[(size_t)(y1 + 1) * (w + 1) + x0] + ii[(size_t)y0 * (w + 1) + x0];
+            dst[(size_t)y * w + x] = (float)(s / ((double)(y1 - y0 + 1) * (x1 - x0 + 1)));
+        }
+    }
+}
+
+static void guided_filter(const Img &guide, std::vector<float> &p, int w, int h,
+                          int r, float eps) {
+    std::vector<float> I((size_t)w * h);
+    for (int y = 0; y < h; y++) {
+        const uint8_t *row = guide.row(y);
+        for (int x = 0; x < w; x++) I[(size_t)y * w + x] = (float)row[x];
+    }
+    std::vector<float> mI, mp, mIp, mII, t1((size_t)w * h), t2((size_t)w * h);
+    boxmean(I, w, h, r, mI);
+    boxmean(p, w, h, r, mp);
+    for (size_t i = 0; i < I.size(); i++) { t1[i] = I[i] * p[i]; t2[i] = I[i] * I[i]; }
+    boxmean(t1, w, h, r, mIp);
+    boxmean(t2, w, h, r, mII);
+    std::vector<float> A((size_t)w * h), B((size_t)w * h);
+    for (size_t i = 0; i < I.size(); i++) {
+        float var = mII[i] - mI[i] * mI[i];
+        float cov = mIp[i] - mI[i] * mp[i];
+        float a = cov / (var + eps);
+        A[i] = a;
+        B[i] = mp[i] - a * mI[i];
+    }
+    std::vector<float> mA, mB;
+    boxmean(A, w, h, r, mA);
+    boxmean(B, w, h, r, mB);
+    for (size_t i = 0; i < p.size(); i++) p[i] = mA[i] * I[i] + mB[i];
+}
+
+// ---- v2 主流程：低分辨率块匹配 → 双线性放大 → guided filter → 全分辨率光流细化 ----
+// 全程不在全分辨率上做"一块一个矢量"，所以不会出现方格。
+static void flow2_dense(const std::vector<Img> &pa, const std::vector<Img> &pb,
+                        int W, int H, std::vector<Vec2> &out,
+                        const std::vector<Vec2> &seedHalf, int sbw, int sbh, int B) {
+    std::vector<float> u((size_t)W * H), v((size_t)W * H);
+    for (int y = 0; y < H; y++) {
+        for (int x = 0; x < W; x++) {
+            Vec2 s = sample_vec_b(seedHalf, sbw, sbh, B, x * 0.5f + 0.25f, y * 0.5f + 0.25f);
+            u[(size_t)y * W + x] = s.x * 2.0f;
+            v[(size_t)y * W + x] = s.y * 2.0f;
+        }
+    }
+    static const float E1 = getenv("ALH_G1") ? (float)atof(getenv("ALH_G1")) : 30.0f;
+    static const float E2 = getenv("ALH_G2") ? (float)atof(getenv("ALH_G2")) : 20.0f;
+    static const float A1 = getenv("ALH_A1") ? (float)atof(getenv("ALH_A1")) : 0.6f;
+    static const float A2 = getenv("ALH_A2") ? (float)atof(getenv("ALH_A2")) : 0.3f;
+    guided_filter(pa[0], u, W, H, 4, E1);
+    guided_filter(pa[0], v, W, H, 4, E1);
+    flow_level(pa[0], pb[0], u, v, 3, A1);
+    guided_filter(pa[0], u, W, H, 3, E2);
+    guided_filter(pa[0], v, W, H, 3, E2);
+    flow_level(pa[0], pb[0], u, v, 2, A2);
+    out.assign((size_t)W * H, Vec2{0, 0});
+    for (size_t i = 0; i < out.size(); i++) out[i] = Vec2{u[i], v[i]};
+}
+
 // 候选竞争：每个像素不只信一个矢量，把「光流、块匹配、反向场推出的矢量、四邻微调」
 // 都代进对称残差里比一遍，谁让两帧对得上就用谁。遮挡边缘靠这条不需要额外的分割。
 static void compete(const Img &a, const Img &b, int W, int H, std::vector<Vec2> &f,
@@ -693,15 +773,10 @@ int main(int argc, char **argv) {
             mkfield(pa, pb, cur, nbw, nbh);
             mkfield(pb, pa, gfield, gw, gh);
             {
+                // 逐像素场：块场只当低分辨率种子，全分辨率靠光流迭代铺开。
+                // 这一档不在全分辨率上写整块矢量——整块写回就是画面上那些方格。
                 vector<Vec2> dense;
-                flow_dense(pa, pb, W, H, dense, (opt & 16777216) ? &cur : nullptr, nbw, nbh, 8);
-                if (opt & 536870912) {
-                    compete(pa[0], pb[0], W, H, dense, cur, nbw, nbh, 8, gfield, gw, gh);
-                }
-                if (opt & 4194304) {
-                    // 每块比一次残差，块匹配更准的整块写回（遮挡边缘靠这条保锐度）
-                    arbitrate(pa[0], pb[0], W, H, dense, cur, nbw, nbh, 8);
-                }
+                flow_dense(pa, pb, W, H, dense, nullptr, 0, 0, 8);
                 cur.swap(dense);
             }
             nbw = W; nbh = H;
@@ -722,7 +797,7 @@ int main(int argc, char **argv) {
         }
         fprintf(stderr, "k=%d match done %dx%d\n", k, nbw, nbh);
         int B = (opt & 8388608) ? 1 : ((opt & 8) ? 4 : 8), bw = nbw, bh = nbh;
-        median3(cur, bw, bh);
+        if (B > 1) median3(cur, bw, bh);
         if (opt & 16) { median3(cur, bw, bh); median3(cur, bw, bh); }   // 多遍中值：压块状拼布
         if (B > 1) {
             if (opt & 1) refine_sub(pa[0], pb[0], cur, B, bw, bh);

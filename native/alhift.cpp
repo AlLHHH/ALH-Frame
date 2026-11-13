@@ -44,6 +44,9 @@ static int g_win = 2;         // 窗比块每边外扩像素（B=8 → 12×12 �
 static int g_fit = 8;        // 全分辨率光流迭代次数（2/4/6/8 → 0.9431/0.9435/0.9437/0.9438）
 static float g_fal = 0.15f;
 static int g_vmed = 1;        // 稠密场矢量中值（去条纹，保留边缘）   // 全分辨率光流平滑系数
+static float g_da = 0.35f;    // DIS 最细层变分平滑系数（越小越锐、越大越滑）
+static int g_dit = 3;         // DIS 最细层变分迭代次数
+static int g_dp = 0;          // DIS 最细层额外 patch 遍数（每遍 P=8、step=2、maxstep 0.5）
 
 // 噪声估计：拉普拉斯响应的 MAD/6 ≈ 高斯噪声 σ（灰阶）
 static float y_sigma(const Img &a) {
@@ -862,6 +865,127 @@ static void flow_hs(const Img &A, const Img &B, std::vector<Vec2> &out) {
     out = upsample_scaled(field, tw, th, A.w, A.h, 1.0f);
 }
 
+// ---------------------------------------------------------------------------
+// DIS 式稠密光流：多尺度 patch 逆向搜索（Gauss-Newton 用块内 Hessian 预解）
+// + 每层变分细化（逐像素 GN + 场平滑）。语义与其它场一致：b(x+u) ≈ a(x)。
+// ---------------------------------------------------------------------------
+static void upf(const std::vector<float> &s, int sw, int sh, std::vector<float> &d, int dw, int dh) {
+    d.assign((size_t)dw * dh, 0.f);
+    for (int y = 0; y < dh; y++) {
+        float fy = ((y + 0.5f) * sh / dh) - 0.5f;
+        int y0 = std::max(0, std::min(sh - 1, (int)floorf(fy)));
+        int y1 = std::min(sh - 1, y0 + 1);
+        float ay = std::max(0.f, std::min(1.f, fy - y0));
+        for (int x = 0; x < dw; x++) {
+            float fx = ((x + 0.5f) * sw / dw) - 0.5f;
+            int x0 = std::max(0, std::min(sw - 1, (int)floorf(fx)));
+            int x1 = std::min(sw - 1, x0 + 1);
+            float ax = std::max(0.f, std::min(1.f, fx - x0));
+            float v00 = s[(size_t)y0 * sw + x0], v01 = s[(size_t)y0 * sw + x1];
+            float v10 = s[(size_t)y1 * sw + x0], v11 = s[(size_t)y1 * sw + x1];
+            d[(size_t)y * dw + x] = (v00 * (1 - ax) + v01 * ax) * (1 - ay) + (v10 * (1 - ax) + v11 * ax) * ay;
+        }
+    }
+}
+
+static void tri_smooth(std::vector<float> &f, int w, int h) { gsmooth(f, w, h); }
+
+// 一层的 patch 逆向搜索：网格步长 step，patch 边长 P，求每块增量并摊回像素
+static void patch_pass(const Img &a, const Img &b, std::vector<float> &u, std::vector<float> &v,
+                       int P, int step, float maxstep) {
+    const int w = a.w, h = a.h;
+    std::vector<float> su((size_t)w * h, 0.f), sv((size_t)w * h, 0.f), wt((size_t)w * h, 0.f);
+    const int half = P / 2;
+    for (int cy = half; cy < h - half; cy += step) {
+        for (int cx = half; cx < w - half; cx += step) {
+            const float u0 = u[(size_t)cy * w + cx], v0 = v[(size_t)cy * w + cx];
+            float gxx = 0, gxy = 0, gyy = 0, bx = 0, by = 0;
+            int n = 0;
+            for (int y = std::max(1, cy - half); y < cy + half - 1; y++) {
+                const uint8_t *row = a.row(y);
+                for (int x = std::max(1, cx - half); x < cx + half - 1; x++) {
+                    float gx = 0.5f * (row[x + 1] - row[x - 1]);
+                    float gy = 0.5f * (a.row(y + 1)[x] - a.row(y - 1)[x]);
+                    float it = bilin(b, x + u0, y + v0) - (float)row[x];
+                    gxx += gx * gx; gxy += gx * gy; gyy += gy * gy;
+                    bx += gx * it; by += gy * it;
+                    n++;
+                }
+            }
+            if (n < 24) continue;
+            float det = gxx * gyy - gxy * gxy;
+            if (det < 1e-2f * (float)n) continue;   // 平坦块：梯度退化，跳过
+            float du = -(gyy * bx - gxy * by) / det;
+            float dv = -(gxx * by - gxy * bx) / det;
+            du = std::max(-maxstep, std::min(maxstep, du));
+            dv = std::max(-maxstep, std::min(maxstep, dv));
+            if (!(du == du) || !(dv == dv)) continue;
+            for (int y = cy - half; y < cy + half; y++)
+                for (int x = cx - half; x < cx + half; x++) {
+                    size_t i = (size_t)y * w + x;
+                    su[i] += du; sv[i] += dv; wt[i] += 1.f;
+                }
+        }
+    }
+    for (size_t i = 0; i < su.size(); i++) {
+        if (wt[i] > 0.f) { u[i] += su[i] / wt[i]; v[i] += sv[i] / wt[i]; }
+    }
+    tri_smooth(u, w, h);
+    tri_smooth(v, w, h);
+}
+
+static void flow_dis(const Img &A, const Img &B, std::vector<Vec2> &out) {
+    std::vector<Img> pa, pb;
+    pa.push_back(A); pb.push_back(B);
+    while ((int)pa.size() < 6 && std::min(pa.back().w, pa.back().h) > 48) {
+        Img na, nb;
+        down2(pa.back(), na); down2(pb.back(), nb);
+        pa.push_back(na); pb.push_back(nb);
+    }
+    const int L = (int)pa.size();
+    int pw = 0, ph = 0;
+    std::vector<float> u, v;
+    for (int l = L - 1; l >= 0; l--) {
+        const Img &a = pa[l], &b = pb[l];
+        if (pw == 0) { u.assign((size_t)a.w * a.h, 0.f); v.assign((size_t)a.w * a.h, 0.f); }
+        else { std::vector<float> nu, nv; upf(u, pw, ph, nu, a.w, a.h); upf(v, pw, ph, nv, a.w, a.h); u.swap(nu); v.swap(nv); }
+        // 粗层大步长、细层小步长；patch 尺寸随层收缩，两次错位网格保证覆盖
+        fprintf(stderr, "dis lvl=%d %dx%d\n", l, a.w, a.h);
+        int P = (l == L - 1) ? 16 : (l == L - 2 ? 12 : 8);
+        patch_pass(a, b, u, v, P, P / 2, 2.0f);
+        patch_pass(a, b, u, v, P, std::max(2, P / 4), 1.5f);
+        patch_pass(a, b, u, v, P, std::max(2, P / 4), 1.0f);
+        for (int it = 0; it < (l == 0 ? g_dit : 3); it++)
+            flow_level(a, b, u, v, 2, (l == 0) ? g_da : 1.2f);
+        for (int e = 0; e < (l == 0 ? g_dp : 0); e++)
+            patch_pass(a, b, u, v, 8, 2, 0.5f);
+        pw = a.w; ph = a.h;
+    }
+    out.resize((size_t)A.w * A.h);
+    for (size_t i = 0; i < out.size(); i++) out[i] = Vec2{u[i], v[i]};
+}
+
+// 前后向一致性：|F(p) + G(p+F(p))| 大于阈值判为遮挡
+static void fb_occlusion(const std::vector<Vec2> &F, const std::vector<Vec2> &G,
+                         int w, int h, float thr, std::vector<uint8_t> &occ) {
+    occ.assign((size_t)w * h, 0);
+    for (int y = 0; y < h; y++) {
+        for (int x = 0; x < w; x++) {
+            size_t i = (size_t)y * w + x;
+            float gx = x + F[i].x, gy = y + F[i].y;
+            if (gx < 0 || gy < 0 || gx > w - 1.001f || gy > h - 1.001f) { occ[i] = 1; continue; }
+            int x0 = (int)gx, y0 = (int)gy;
+            int x1 = std::min(w - 1, x0 + 1), y1 = std::min(h - 1, y0 + 1);
+            float ax = gx - x0, ay = gy - y0;
+            Vec2 q00 = G[(size_t)y0 * w + x0], q01 = G[(size_t)y0 * w + x1];
+            Vec2 q10 = G[(size_t)y1 * w + x0], q11 = G[(size_t)y1 * w + x1];
+            float bx = (q00.x * (1 - ax) + q01.x * ax) * (1 - ay) + (q10.x * (1 - ax) + q11.x * ax) * ay;
+            float by = (q00.y * (1 - ax) + q01.y * ax) * (1 - ay) + (q10.y * (1 - ax) + q11.y * ax) * ay;
+            float ex = F[i].x + bx, ey = F[i].y + by;
+            occ[i] = (sqrtf(ex * ex + ey * ey) > thr) ? 1 : 0;
+        }
+    }
+}
 int main(int argc, char **argv) {
     if (argc < 6) {
         fprintf(stderr, "usage: alhift in.yuv W H N out.yuv [mult]\n");
@@ -880,6 +1004,9 @@ int main(int argc, char **argv) {
     if (const char *e = getenv("ALH_FIT")) g_fit = atoi(e);
     if (const char *e = getenv("ALH_FAL")) g_fal = (float)atof(e);
     if (const char *e = getenv("ALH_VMED")) g_vmed = atoi(e);
+    if (const char *e = getenv("ALH_DA")) g_da = (float)atof(e);
+    if (const char *e = getenv("ALH_DIT")) g_dit = atoi(e);
+    if (const char *e = getenv("ALH_DP")) g_dp = atoi(e);
     if (const char *e = getenv("ALH_OFRES")) g_ofres = atoi(e);
     if (const char *e = getenv("ALH_HSOUT")) g_hsout = atoi(e);
     if (const char *e = getenv("ALH_HSIN")) g_hsin = atoi(e);
@@ -1008,11 +1135,12 @@ int main(int argc, char **argv) {
                 blend_candidates(pb[0], pa[0], W, H, gfield, blkb, bkw2, bkh2, 8);
             }
         } else if (opt & 1073741824) {
-            // 变分光流路线：低分辨率 SOR 求解，放大回全分辨率
-            flow_hs(pa[0], pb[0], cur);
-            flow_hs(pb[0], pa[0], gfield);
+            // DIS 式稠密光流：多尺度 patch 逆向搜索 + 每层变分细化，输出逐像素连续场
+            cur.assign((size_t)W * H, Vec2{0.f, 0.f});
+            gfield.assign((size_t)W * H, Vec2{0.f, 0.f});
+            flow_dis(pa[0], pb[0], cur);
+            flow_dis(pb[0], pa[0], gfield);
             nbw = W; nbh = H; gw = W; gh = H;
-            fprintf(stderr, "k=%d flow vari\n", k);
         } else if (opt & 8388608) {
             // 稠密光流路线：块匹配给大位移种子，稠密迭代把场拉连续、补到亚像素
             mkfield(pa, pb, cur, nbw, nbh);
@@ -1097,6 +1225,9 @@ int main(int argc, char **argv) {
         }
 
         fprintf(stderr, "k=%d conf done\n", k);
+        // 稠密光流档：用前后向一致性标出遮挡像素，合成时那里只取一侧，避免双影
+        std::vector<uint8_t> occ;
+        if (opt & 1073741824) fb_occlusion(cur, gfield, W, H, 1.5f, occ);
         const int hw = W / 2, hh = H / 2;
         const float SIG2 = 2.0f * 40.0f * 40.0f;
         // 输出本区间所有帧：t 按真实相位算，非整数倍也成立，帧数严格等于 round(N×倍率)。
@@ -1202,6 +1333,8 @@ int main(int argc, char **argv) {
                             val = mx;
                         }
                     }
+                    // 遮挡区只取一侧：被遮住的那一侧本来就看不到，混进来就是双影
+                    if (!occ.empty() && occ[(size_t)y * W + x]) val = (t < 0.5f) ? P0 : P1;
                     oy[(size_t)y * W + x] = (uint8_t)std::max(0, std::min(255, (int)lroundf(val)));
                 }
             }

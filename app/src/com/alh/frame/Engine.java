@@ -815,7 +815,7 @@ public class Engine {
             // 档位差别在匹配窗大小与精修开关，实测（12 帧统一口径）：
             // 360p 0.9944/0.9960；720p 0.9925/0.9952；1080p 0.9923/0.9947/0.9952；1440p 0.9925/0.9947/0.9948。
             switch (profile) {
-                case 2:  o = 33980417; break;            // Pro：rad8 + 反向候选 + 亚像素 + OBMC 多邻块合成
+                case 2:  o = 4194304 | 131072 | 262144; break;   // Pro：双向稠密光流（低分解算 + 全分精修 + 一致性权重）
                 case 1:  o = 33980417; break;            // Standard：rad8 + 反向候选 + 亚像素
                 default: o = 262144 | 32 | 524288;       // Lite：rad6 + LK，最省
             }
@@ -830,7 +830,8 @@ public class Engine {
             int win = profile == 2 ? (px > 6000000L ? 6 : 8) : (profile == 1 ? 4 : 2);
             String env = "ALH_WIN=" + win + " ";
             if (profile != 0) env += "ALH_JBU=1 ALH_BICU=1 ";
-            if (profile == 2) env += "ALH_PM=2 ALH_OB3=3 ALH_OBW=32 ALH_TPRED=1 ";
+            if (profile == 2) env += "ALH_OFRES=" + (px > 1000000L ? 400 : 250) + " ALH_GNREF=3 ALH_GNA=0.6 ALH_GNS=1 ";
+            if (profile == 2) win = 0;
             if (profile == 1) env += "ALH_PM=2 ALH_OB3=1 ALH_OBW=16 ";
             if (profile == 2) env += "ALH_ITER=1 ";
             StringBuilder sb = new StringBuilder();

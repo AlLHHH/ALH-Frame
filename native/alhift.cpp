@@ -49,6 +49,9 @@ static int g_dit = 3;         // DIS 最细层变分迭代次数
 static int g_dp = 0;
 static float g_dms = 2.0f;    // DIS patch 每轮位移上限（大位移靠这个放开）
 static int g_dpe = 0;         // DIS 最细层额外 patch 遍数（P=8/step=2/maxstep=0.5）
+static int g_gnref = 0;       // after low-res solve: extra full-res GN rounds (0 = none)
+static float g_gna = 1.0f;    // alpha2 for those rounds (smaller = sharper)
+static int g_gns = 0;         // [1 2 1] smoothing passes before those rounds
 static float g_dupThr = -1.f; // 去重阈值：按噪声自动定，<0 表示还没算
 static int g_lv = 6;          // 稠密光流金字塔最大层数（调参用）
 static int g_lvmed = 1;       // 层间矢量场上采样后做 3x3 分量中值（1=开）
@@ -846,6 +849,14 @@ static void flow_gn_lowres(const Img &A, const Img &B, std::vector<Vec2> &out) {
     if ((int)small.size() != tw * th) small.assign((size_t)tw * th, Vec2{0, 0});
     float mag = (float)A.w / (float)tw;
     out = upsample_scaled(small, tw, th, A.w, A.h, mag);
+    if (g_gnref > 0 || g_gns > 0) {
+        const int w = A.w, h = A.h;
+        std::vector<float> u((size_t)w * h), v((size_t)w * h);
+        for (size_t i = 0; i < (size_t)w * h; i++) { u[i] = out[i].x; v[i] = out[i].y; }
+        for (int s = 0; s < g_gns; s++) { gsmooth(u, w, h); gsmooth(v, w, h); }
+        for (int it = 0; it < g_gnref; it++) flow_level(A, B, u, v, 1, g_gna);
+        for (size_t i = 0; i < (size_t)w * h; i++) { out[i].x = u[i]; out[i].y = v[i]; }
+    }
 }
 
 static void flow_hs(const Img &A, const Img &B, std::vector<Vec2> &out) {
@@ -1149,6 +1160,9 @@ int main(int argc, char **argv) {
     if (const char *e = getenv("ALH_COS")) g_cos = atoi(e);
     if (const char *e = getenv("ALH_OCC")) g_occ = atoi(e);
     if (const char *e = getenv("ALH_OFRES")) g_ofres = atoi(e);
+    if (const char *e = getenv("ALH_GNREF")) g_gnref = atoi(e);
+    if (const char *e = getenv("ALH_GNA")) g_gna = (float)atof(e);
+    if (const char *e = getenv("ALH_GNS")) g_gns = atoi(e);
     if (const char *e = getenv("ALH_HSOUT")) g_hsout = atoi(e);
     if (const char *e = getenv("ALH_HSIN")) g_hsin = atoi(e);
     if (const char *e = getenv("ALH_HSA")) g_hsa = (float)atof(e);

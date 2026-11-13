@@ -16,7 +16,7 @@ export PATH="$JAVA:$PATH"
 KS="$APP/alhframe.jks"
 KS_PASS="alh123"
 KS_ALIAS="alhframe"
-OUT="$BUILD/ALHFrame-1.3.apk"
+OUT="$BUILD/ALHFrame-1.2.apk"
 
 rm -rf "$BUILD"
 mkdir -p "$WORK/classes" "$WORK/dex" "$WORK/gen"

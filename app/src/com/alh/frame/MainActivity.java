@@ -476,34 +476,15 @@ public class MainActivity extends Activity {
 
     // ------------------------------------------------------------------ 流程
 
-    // 三个类型各一列，列内按版本堆叠；code 就是 Engine 的 profile
+    // 三档，一列一个：Lite 最快 / Standard 均衡 / Pro 最慢但画质最好
     static final String[] ENGINE_TYPES = {"Lite", "Standard", "Pro"};
-    static final String[][] ENGINE_VERS = {
-            {"v1"},
-            {"v1", "v2"},
-            {"v1"}};
-    static final int[][] ENGINE_CODES = {
-            {0},
-            {1, 2},
-            {3}};
-
-    static int typeOf(int code) {
-        return code == 0 ? 0 : (code <= 2 ? 1 : 2);
-    }
-
-    static int verOf(int code) {
-        if (code == 0) return 0;
-        if (code == 1) return 0;
-        if (code == 2) return 1;
-        if (code == 3) return 0;
-        return 1;
-    }
+    static final String[] ENGINE_HINT = {"最快", "均衡", "最佳画质"};
 
     static String labelOf(int code) {
-        return "ALH Frame " + ENGINE_TYPES[typeOf(code)] + " " + ENGINE_VERS[typeOf(code)][verOf(code)];
+        return "ALH Frame " + ENGINE_TYPES[code];
     }
 
-    // 自绘下拉：三列（Lite / Standard / Pro），每列按版本堆叠，避免系统弹出的白边框
+    // 自绘下拉：三列，一列一档，避免系统弹出的白边框
     private void showEngineMenu(View anchor) {
         final android.widget.PopupWindow[] holder = new android.widget.PopupWindow[1];
         LinearLayout box = new LinearLayout(this);
@@ -513,29 +494,30 @@ public class MainActivity extends Activity {
         box.setBackground(bg);
         box.setPadding(dp(4), dp(8), dp(4), dp(8));
         for (int t = 0; t < ENGINE_TYPES.length; t++) {
+            final int code = t;
             LinearLayout col = new LinearLayout(this);
             col.setOrientation(LinearLayout.VERTICAL);
-            TextView head = text(ENGINE_TYPES[t], 12, C_DIM, false);
-            head.setSingleLine(true);
-            head.setLetterSpacing(0.06f);
-            head.setPadding(dp(10), dp(4), dp(10), dp(6));
-            col.addView(head, lp(-1, -2, 0, 0, 0, 0));
-            for (int v = 0; v < ENGINE_VERS[t].length; v++) {
-                final int code = ENGINE_CODES[t][v];
-                TextView row = text(ENGINE_VERS[t][v], 15, code == engineMode ? C_ACC : C_TEXT, false);
-                row.setSingleLine(true);
-                row.setPadding(dp(10), dp(11), dp(10), dp(11));
-                row.setBackground(round(code == engineMode ? 0x1A3B82F6 : 0x00000000, dp(9)));
-                row.setOnClickListener(new View.OnClickListener() {
-                    public void onClick(View v) {
-                        setEngine(code);
-                        if (holder[0] != null) {
-                            holder[0].dismiss();
-                        }
+            col.setPadding(dp(6), dp(6), dp(6), dp(6));
+            col.setBackground(round(code == engineMode ? 0x1A3B82F6 : 0x00000000, dp(10)));
+
+            TextView name = text(ENGINE_TYPES[t], 15, code == engineMode ? C_ACC : C_TEXT, false);
+            name.setSingleLine(true);
+            name.setGravity(android.view.Gravity.CENTER);
+            TextView hint = text(ENGINE_HINT[t], 11, C_DIM, false);
+            hint.setSingleLine(true);
+            hint.setGravity(android.view.Gravity.CENTER);
+            hint.setPadding(0, dp(3), 0, 0);
+
+            col.addView(name, lp(-1, -2, 0, 0, 0, 0));
+            col.addView(hint, lp(-1, -2, 0, 0, 0, 0));
+            col.setOnClickListener(new View.OnClickListener() {
+                public void onClick(View v) {
+                    setEngine(code);
+                    if (holder[0] != null) {
+                        holder[0].dismiss();
                     }
-                });
-                col.addView(row, lp(-1, -2, 0, 0, 0, 0));
-            }
+                }
+            });
             box.addView(col, new LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f));
         }
         final android.widget.PopupWindow pop = new android.widget.PopupWindow(box,
@@ -555,25 +537,19 @@ public class MainActivity extends Activity {
         if (tvEngineNote != null) {
             String note;
             if (e == 0) {
-                note = "基于 ffmpeg minterpolate：复杂运动更稳，推荐日常使用。";
+                note = "最快：小搜索半径，逐帧速度快，适合长片先出结果。";
             } else if (e == 1) {
-                note = "自研内核：块匹配，速度快，细节更锐。";
-            } else if (e == 2) {
-                note = "自研光流：流场先在低分辨率上解算再逐像素融合，边缘平滑，速度快。";
+                note = "均衡：搜索半径加大并启用亚像素精修，画质比 Lite 高一点，耗时略增。";
             } else {
-                note = "质量优先：块匹配 + 亚像素精修 + 宽窗搜索，速度约为标准档一半，复杂运动更稳。";
+                note = "最佳画质：最细层搜索半径 16 + 宽匹配窗 + 可见性加权，速度最慢，复杂运动最稳。";
             }
             tvEngineNote.setText(note);
         }
         if (rowDedup != null) {
-            // 去重复帧是自研内核的开关，Lite 上不显示，免得看成对 ffmpeg 也能用
-            rowDedup.setVisibility(e != 0 ? View.VISIBLE : View.GONE);
-            swDedup.setEnabled(e != 0);
-            swDedup.setAlpha(e != 0 ? 1f : 0.4f);
-            if (e == 0) {
-                dedup = false;
-                swDedup.setOn(false, false);
-            }
+            // 三档都走自研内核，去重复帧都可用
+            rowDedup.setVisibility(View.VISIBLE);
+            swDedup.setEnabled(true);
+            swDedup.setAlpha(1f);
         }
     }
 

@@ -815,7 +815,7 @@ public class Engine {
             // 档位差别在匹配窗大小与精修开关，实测（12 帧统一口径）：
             // 360p 0.9944/0.9960；720p 0.9925/0.9952；1080p 0.9923/0.9947/0.9952；1440p 0.9925/0.9947/0.9948。
             switch (profile) {
-                case 2:  o = 33947649 | 524288; break;   // Pro：rad8 + 反向候选 + 亚像素 + LK，配宽窗与边缘引导
+                case 2:  o = 33980417; break;            // Pro：rad8 + 反向候选 + 亚像素 + OBMC 多邻块合成
                 case 1:  o = 33947649; break;            // Standard：rad8 + 反向候选 + 亚像素
                 default: o = 262144 | 32 | 524288;       // Lite：rad6 + LK，最省
             }
@@ -830,6 +830,7 @@ public class Engine {
             int win = profile == 2 ? (px > 6000000L ? 6 : 8) : (profile == 1 ? 4 : 2);
             String env = "ALH_WIN=" + win + " ";
             if (profile != 0) env += "ALH_JBU=1 ALH_BICU=1 ";
+            if (profile == 2) env += "ALH_PM=2 ALH_OB3=3 ALH_OBW=32 ALH_TPRED=1 ";
             if (profile == 2) env += "ALH_ITER=1 ";
             StringBuilder sb = new StringBuilder();
             sb.append(q(ff)).append(" -hide_banner -nostdin -v error -ss ").append(ss)

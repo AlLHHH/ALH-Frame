@@ -1,16 +1,5 @@
 #!/usr/bin/env bash
-# ALH Frame 构建脚本（不依赖 Gradle）：aapt2 -> javac -> d8 -> zipalign -> apksigner
-#
-# 依赖（自行准备，不入库）：
-#   tools/sdkroot/build-tools/35.0.0     Android SDK Build-Tools
-#   tools/sdkroot/platforms/android-33    Android SDK Platform
-#   tools/jdk-21.0.13+9                   JDK 21
-#   app/assets/ff/ffmpeg                  静态编译的 ffmpeg 可执行文件（见 app/assets/ff/README.md）
-#
-# 签名：默认产出未签名包。要签名的，导出下面三个环境变量后重跑：
-#   ALH_KS       keystore 路径
-#   ALH_KS_PASS  keystore 口令
-#   ALH_KS_ALIAS key 别名
+# ALH Frame build (no Gradle): aapt2 -> javac -> d8 -> zipalign -> apksigner
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")" && pwd -W)"
@@ -24,11 +13,10 @@ PLATFORM="$SDK/platforms/android-33/android.jar"
 JAVA="$TOOLS/jdk-21.0.13+9/bin"
 export JAVA_HOME="$(dirname "$JAVA")"
 export PATH="$JAVA:$PATH"
-
-VERSION_CODE=1
-VERSION_NAME="1.0"
-UNSIGNED="$BUILD/ALHFrame-unsigned.apk"
-OUT="$BUILD/ALHFrame-$VERSION_NAME.apk"
+KS="$APP/alhframe.jks"
+KS_PASS="alh123"
+KS_ALIAS="alhframe"
+OUT="$BUILD/ALHFrame-1.2.apk"
 
 rm -rf "$BUILD"
 mkdir -p "$WORK/classes" "$WORK/dex" "$WORK/gen"
@@ -45,8 +33,8 @@ echo "[2/6] aapt2 link"
   --java "$WORK/gen" \
   --min-sdk-version 24 \
   --target-sdk-version 28 \
-  --version-code "$VERSION_CODE" \
-  --version-name "$VERSION_NAME" \
+  --version-code 3 \
+  --version-name 1.2 \
   --auto-add-overlay
 
 echo "[3/6] javac"
@@ -63,23 +51,30 @@ find "$WORK/classes" -name '*.class' > "$WORK/classes.txt"
 
 echo "[5/6] package + zipalign"
 cp "$WORK/base.apk" "$WORK/unsigned.apk"
-python - "$WORK/unsigned.apk" "$WORK/dex/classes.dex" <<'PY'
+python -c "
 import sys, zipfile
 apk, dex = sys.argv[1], sys.argv[2]
 z = zipfile.ZipFile(apk, 'a', zipfile.ZIP_DEFLATED)
 z.write(dex, 'classes.dex')
 z.close()
 print('classes.dex injected')
-PY
-"$BT/zipalign" -p -f 4 "$WORK/unsigned.apk" "$UNSIGNED"
+" "$WORK/unsigned.apk" "$WORK/dex/classes.dex"
+"$BT/zipalign" -f -p 4 "$WORK/unsigned.apk" "$WORK/aligned.apk"
 
 echo "[6/6] sign"
-if [[ -n "${ALH_KS:-}" && -n "${ALH_KS_PASS:-}" && -n "${ALH_KS_ALIAS:-}" ]]; then
-  "$BT/apksigner.bat" sign --ks "$ALH_KS" --ks-key-alias "$ALH_KS_ALIAS" \
-    --ks-pass "pass:$ALH_KS_PASS" --key-pass "pass:$ALH_KS_PASS" \
-    --out "$OUT" "$UNSIGNED"
-  echo "OK -> $OUT"
-else
-  mv "$UNSIGNED" "$BUILD/ALHFrame-$VERSION_NAME-unsigned.apk"
-  echo "OK -> $BUILD/ALHFrame-$VERSION_NAME-unsigned.apk（未签名，设置 ALH_KS / ALH_KS_PASS / ALH_KS_ALIAS 可签名）"
+if [ ! -f "$KS" ]; then
+  "$JAVA/keytool" -genkeypair -keystore "$KS" -alias "$KS_ALIAS" \
+    -keyalg RSA -keysize 2048 -validity 10000 \
+    -storepass "$KS_PASS" -keypass "$KS_PASS" \
+    -dname "CN=ALHFrame, O=ALH, C=CN" >/dev/null 2>&1
+  echo "  generated $KS"
 fi
+"$BT/apksigner.bat" sign --ks "$KS" --ks-key-alias "$KS_ALIAS" \
+  --ks-pass "pass:$KS_PASS" --key-pass "pass:$KS_PASS" \
+  --v1-signing-enabled true --v2-signing-enabled true \
+  --out "$OUT" "$WORK/aligned.apk"
+"$BT/apksigner.bat" verify --print-certs "$OUT" | head -5
+
+rm -rf "$WORK" "$OUT.idsig"
+ls -l "$OUT"
+echo "OK -> $OUT"

@@ -804,7 +804,10 @@ public class Engine {
          * 三段用同一个 sh 管道串起来，按最后一段的退出码判定成败。
          */
         void runPro(String ss, double want) {
-            int nfr = Math.max(2, (int) Math.round(want * srcFps));
+            // 倍率按真实帧率比给（可非整数：24fps→60fps 是 2.5 倍），内核按相位取整出帧，
+            // 帧数严格等于 round(输入帧数×倍率)，再由 trim=end_frame 裁到本段应出的帧数。
+            double ratio = outFps / srcFps;
+            int nfr = Math.max(2, (int) Math.ceil(want * srcFps) + 1);
             final int opt = 49413 | 33554432 | 131072 | 262144 | (dedup ? 4096 : 0);
             int f0 = (int) Math.round(tStart * outFps);
             String vf = "trim=end_frame=" + frames
@@ -815,7 +818,7 @@ public class Engine {
                     .append(" -i ").append(q(src.getAbsolutePath()))
                     .append(" -an -f rawvideo -pix_fmt yuv420p -");
             sb.append(" | ").append(q(proBin)).append(" - ").append(vw).append(' ').append(vh)
-                    .append(' ').append(nfr).append(" - ").append(mult).append(' ').append(opt);
+                    .append(' ').append(nfr).append(" - ").append(fmt(ratio)).append(' ').append(opt);
             sb.append(" | ").append(q(ff))
                     .append(" -hide_banner -nostdin -v error -y -f rawvideo -pix_fmt yuv420p -s ")
                     .append(vw).append('x').append(vh).append(" -r ").append(fmt(outFps))

@@ -815,9 +815,11 @@ public class Engine {
             // v2 起用上「先解低分辨率流场、再逐像素择优」的路子；Pro 换成块匹配 + 亚像素精修 +
             // 更宽的匹配窗（ALH_WIN=6），慢一倍，梯度与大位移更稳。
             switch (profile) {
-                case 2:  o = 49413 | 134217728 | 131072 | 262144 | 524288 | 2097152; break; // Pro：最细层 rad16 + 可见性
-                case 1:  o = 49413 | 33554432 | 131072 | 262144 | 524288; break;          // Standard：rad8
-                default: o = 262144 | 32 | 524288;                                        // Lite：rad6，最省
+                // Pro：逐像素稠密光流。整幅场先在短边 400 上解，放大回全分辨率后再跑两轮 GN 精修，
+                // 合成只按时间相位加权 —— 场是连续的，所以看不到块边界。
+                case 2:  o = 4194304 | 256; break;
+                case 1:  o = 49413 | 33554432 | 131072 | 262144 | 524288; break;          // Standard：块匹配 rad8
+                default: o = 262144 | 32 | 524288;                                        // Lite：块匹配 rad6，最省
             }
             if (dedup) o |= 4096;
             final int opt = o;
@@ -826,7 +828,7 @@ public class Engine {
                     + ",setpts=N/(" + fmt(outFps) + "*TB)+" + f0 + "/(" + fmt(outFps) + "*TB)";
             int shortSide = Math.min(vw, vh);
             String env = "ALH_OFRES=" + (shortSide >= 900 ? 400 : 250) + " ";
-            if (profile == 2) env += "ALH_WIN=6 ALH_PEN=0.15 ";;
+            if (profile == 2) env = "ALH_OFRES=400 ALH_GNREF=2 ALH_GNA=1.0 ALH_GNS=1 "; // Pro 稠密档固定 400 短边
             StringBuilder sb = new StringBuilder();
             sb.append(q(ff)).append(" -hide_banner -nostdin -v error -ss ").append(ss)
                     .append(" -t ").append(fmt(want))

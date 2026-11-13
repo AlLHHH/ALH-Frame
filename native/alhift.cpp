@@ -336,6 +336,155 @@ static void refine_dense(const Img &a, const Img &b, vector<Vec2> &v, int B, int
     v.swap(cur);
 }
 
+// ───────── 稠密光流（金字塔 Horn-Schunck / Gauss-Newton）─────────
+// 块匹配给出的是「8×8 一格、只有整数像素」的矢量，接缝与整像素量化就是果冻的来源。
+// 这里换成逐像素的稠密场：每层用 Gauss-Newton 求残差最小的位移，再做 [1 2 1] 平滑把场拉连续，
+// 从 1/8 分辨率一路细化到 1/2，最后双线性放大回全分辨率。
+static void gsmooth(std::vector<float> &f, int w, int h) {
+    std::vector<float> t(f.size());
+    for (int y = 0; y < h; y++) {
+        const float *r = &f[(size_t)y * w];
+        float *o = &t[(size_t)y * w];
+        for (int x = 0; x < w; x++) {
+            int x0 = std::max(0, x - 1), x1 = std::min(w - 1, x + 1);
+            o[x] = (r[x0] + 2.0f * r[x] + r[x1]) * 0.25f;
+        }
+    }
+    for (int y = 0; y < h; y++) {
+        int y0 = std::max(0, y - 1), y1 = std::min(h - 1, y + 1);
+        const float *a = &t[(size_t)y0 * w], *b = &t[(size_t)y * w], *c = &t[(size_t)y1 * w];
+        float *o = &f[(size_t)y * w];
+        for (int x = 0; x < w; x++) o[x] = (a[x] + 2.0f * b[x] + c[x]) * 0.25f;
+    }
+}
+
+static void flow_level(const Img &a, const Img &b, std::vector<float> &u, std::vector<float> &v,
+                       int iters, float alpha2) {
+    const int w = a.w, h = a.h;
+    const int nthreads = std::max(1u, std::thread::hardware_concurrency());
+    for (int it = 0; it < iters; it++) {
+        auto work = [&](int y0, int y1) {
+            for (int y = y0; y < y1; y++) {
+                for (int x = 0; x < w; x++) {
+                    size_t i = (size_t)y * w + x;
+                    float ux = u[i], uy = v[i];
+                    float wx = x + ux, wy = y + uy;
+                    if (wx < 1 || wy < 1 || wx > w - 2 || wy > h - 2) { continue; }
+                    float bw = bilin(b, wx, wy);
+                    float gx = (bilin(b, wx + 1, wy) - bilin(b, wx - 1, wy)) * 0.5f;
+                    float gy = (bilin(b, wx, wy + 1) - bilin(b, wx, wy - 1)) * 0.5f;
+                    float r = (float)a.row(y)[x] - bw;
+                    float den = gx * gx + gy * gy + alpha2;
+                    float du = gx * r / den, dv = gy * r / den;
+                    du = std::max(-2.0f, std::min(2.0f, du));
+                    dv = std::max(-2.0f, std::min(2.0f, dv));
+                    u[i] = ux + du;
+                    v[i] = uy + dv;
+                }
+            }
+        };
+        std::vector<std::thread> th;
+        int step = std::max(1, h / nthreads);
+        for (int y = 0; y < h; y += step) th.emplace_back(work, y, std::min(h, y + step));
+        for (auto &t : th) t.join();
+        gsmooth(u, w, h);
+        gsmooth(v, w, h);
+    }
+}
+
+// 从 half 分辨率金字塔求场，再双线性放大到全分辨率；返回的场语义：b(x+u) ≈ a(x)
+static void flow_dense(const std::vector<Img> &pa, const std::vector<Img> &pb, int W, int H,
+                       std::vector<Vec2> &out, const std::vector<Vec2> *seed = nullptr,
+                       int sbw = 0, int sbh = 0, int sB = 8) {
+    std::vector<float> u, v;
+    int pw = 0, ph = 0;
+    for (int l = LEVELS - 1; l >= 1; l--) {
+        int w = pa[l].w, h = pa[l].h;
+        if (u.empty()) {
+            u.assign((size_t)w * h, 0.0f); v.assign((size_t)w * h, 0.0f);
+            if (seed && !seed->empty()) {
+                for (int y = 0; y < h; y++)
+                    for (int x = 0; x < w; x++) {
+                        Vec2 sv = sample_vec_b(*seed, sbw, sbh, sB, x * 2, y * 2);
+                        u[(size_t)y * w + x] = sv.x * 0.5f;
+                        v[(size_t)y * w + x] = sv.y * 0.5f;
+                    }
+            }
+        }
+        else {
+            // 上一层的场放大两倍：粗层的 1 px 等于细层的 2 px
+            std::vector<float> nu((size_t)w * h), nv((size_t)w * h);
+            for (int y = 0; y < h; y++) {
+                for (int x = 0; x < w; x++) {
+                    float sx = (x + 0.5f) * 0.5f - 0.5f, sy = (y + 0.5f) * 0.5f - 0.5f;
+                    int x0 = (int)floorf(sx), y0 = (int)floorf(sy);
+                    float ax = sx - x0, ay = sy - y0;
+                    auto at = [&](const std::vector<float> &f, int xx, int yy) {
+                        xx = std::max(0, std::min(pw - 1, xx));
+                        yy = std::max(0, std::min(ph - 1, yy));
+                        return f[(size_t)yy * pw + xx];
+                    };
+                    float a00 = at(u, x0, y0), a10 = at(u, x0 + 1, y0), a01 = at(u, x0, y0 + 1), a11 = at(u, x0 + 1, y0 + 1);
+                    float b00 = at(v, x0, y0), b10 = at(v, x0 + 1, y0), b01 = at(v, x0, y0 + 1), b11 = at(v, x0 + 1, y0 + 1);
+                    nu[(size_t)y * w + x] = 2.0f * ((a00 * (1 - ax) + a10 * ax) * (1 - ay) + (a01 * (1 - ax) + a11 * ax) * ay);
+                    nv[(size_t)y * w + x] = 2.0f * ((b00 * (1 - ax) + b10 * ax) * (1 - ay) + (b01 * (1 - ax) + b11 * ax) * ay);
+                }
+            }
+            u.swap(nu); v.swap(nv);
+        }
+        pw = w; ph = h;
+        flow_level(pa[l], pb[l], u, v, 4, 2.0f);
+        flow_level(pa[l], pb[l], u, v, 2, 0.5f);
+    }
+    // 放大到全分辨率后，再在全分辨率上做两轮轻量高斯牛顿：放大插值会磨掉细节，
+    // 这一步把它拉回真实位置（只平滑一次，别把边缘糊了）
+    {
+        std::vector<float> fu((size_t)W * H), fv((size_t)W * H);
+        for (int y = 0; y < H; y++)
+            for (int x = 0; x < W; x++) {
+                float sx = (x + 0.5f) * 0.5f - 0.5f, sy = (y + 0.5f) * 0.5f - 0.5f;
+                int x0 = (int)floorf(sx), y0 = (int)floorf(sy);
+                float ax = sx - x0, ay = sy - y0;
+                auto at = [&](int xx, int yy, bool horiz) {
+                    xx = std::max(0, std::min(pw - 1, xx));
+                    yy = std::max(0, std::min(ph - 1, yy));
+                    size_t i = (size_t)yy * pw + xx;
+                    return horiz ? u[i] : v[i];
+                };
+                fu[(size_t)y * W + x] = 2.0f * ((at(x0, y0, 1) * (1 - ax) + at(x0 + 1, y0, 1) * ax) * (1 - ay)
+                                              + (at(x0, y0 + 1, 1) * (1 - ax) + at(x0 + 1, y0 + 1, 1) * ax) * ay);
+                fv[(size_t)y * W + x] = 2.0f * ((at(x0, y0, 0) * (1 - ax) + at(x0 + 1, y0, 0) * ax) * (1 - ay)
+                                              + (at(x0, y0 + 1, 0) * (1 - ax) + at(x0 + 1, y0 + 1, 0) * ax) * ay);
+            }
+        for (int it = 0; it < 2; it++) {
+            flow_level(pa[0], pb[0], fu, fv, 1, 0.4f);
+        }
+        out.assign((size_t)W * H, Vec2{0, 0});
+        for (size_t i = 0; i < out.size(); i++) out[i] = Vec2{fu[i], fv[i]};
+        return;
+    }
+    // 放大到全分辨率
+    out.assign((size_t)W * H, Vec2{0, 0});
+    for (int y = 0; y < H; y++) {
+        for (int x = 0; x < W; x++) {
+            float sx = (x + 0.5f) * 0.5f - 0.5f, sy = (y + 0.5f) * 0.5f - 0.5f;
+            int x0 = (int)floorf(sx), y0 = (int)floorf(sy);
+            float ax = sx - x0, ay = sy - y0;
+            auto at = [&](int xx, int yy, bool horiz) {
+                xx = std::max(0, std::min(pw - 1, xx));
+                yy = std::max(0, std::min(ph - 1, yy));
+                size_t i = (size_t)yy * pw + xx;
+                return horiz ? u[i] : v[i];
+            };
+            float uu = (at(x0, y0, 1) * (1 - ax) + at(x0 + 1, y0, 1) * ax) * (1 - ay)
+                     + (at(x0, y0 + 1, 1) * (1 - ax) + at(x0 + 1, y0 + 1, 1) * ax) * ay;
+            float vv = (at(x0, y0, 0) * (1 - ax) + at(x0 + 1, y0, 0) * ax) * (1 - ay)
+                     + (at(x0, y0 + 1, 0) * (1 - ax) + at(x0 + 1, y0 + 1, 0) * ax) * ay;
+            out[(size_t)y * W + x] = Vec2{uu * 2.0f, vv * 2.0f};
+        }
+    }
+}
+
 int main(int argc, char **argv) {
     if (argc < 6) {
         fprintf(stderr, "usage: alhift in.yuv W H N out.yuv [mult]\n");
@@ -460,10 +609,23 @@ int main(int argc, char **argv) {
         };
         int nbw = 0, nbh = 0;
         vector<Vec2> cur;
-        mkfield(pa, pb, cur, nbw, nbh);
         vector<Vec2> gfield; int gw = 0, gh = 0;
-        // 反向场始终要算：合成阶段用它做双向一致性校验，遮盖/遮挡区才不会糊成重影
-        mkfield(pb, pa, gfield, gw, gh);
+        if (opt & 8388608) {
+            // 稠密光流路线：块匹配给大位移种子，稠密迭代把场拉连续、补到亚像素
+            mkfield(pa, pb, cur, nbw, nbh);
+            mkfield(pb, pa, gfield, gw, gh);
+            {
+                vector<Vec2> dense;
+                flow_dense(pa, pb, W, H, dense, (opt & 16777216) ? &cur : nullptr, nbw, nbh, 8);
+                cur.swap(dense);
+            }
+            nbw = W; nbh = H;
+            fprintf(stderr, "k=%d flow dense\n", k);
+        } else {
+            mkfield(pa, pb, cur, nbw, nbh);
+            // 反向场始终要算：合成阶段用它做双向一致性校验，遮挡区才不会糊成重影
+            mkfield(pb, pa, gfield, gw, gh);
+        }
         // opt&8: 在最细层再做一遍 4×4 块精修（矢量场加密，减少块状接缝）
         if (opt & 8) {
             int B2 = 4;
@@ -474,12 +636,14 @@ int main(int argc, char **argv) {
             cur = res; nbw = rw; nbh = rh;
         }
         fprintf(stderr, "k=%d match done %dx%d\n", k, nbw, nbh);
-        int B = (opt & 8) ? 4 : 8, bw = nbw, bh = nbh;
+        int B = (opt & 8388608) ? 1 : ((opt & 8) ? 4 : 8), bw = nbw, bh = nbh;
         median3(cur, bw, bh);
         if (opt & 16) { median3(cur, bw, bh); median3(cur, bw, bh); }   // 多遍中值：压块状拼布
-        if (opt & 1) refine_sub(pa[0], pb[0], cur, B, bw, bh);
-        if (opt & 524288) refine_lk(pa[0], pb[0], cur, B, bw, bh, 3);
-        if (opt & 1048576) refine_dense(pa[0], pb[0], cur, B, bw, bh, 3);
+        if (B > 1) {
+            if (opt & 1) refine_sub(pa[0], pb[0], cur, B, bw, bh);
+            if (opt & 524288) refine_lk(pa[0], pb[0], cur, B, bw, bh, 3);
+            if (opt & 1048576) refine_dense(pa[0], pb[0], cur, B, bw, bh, 3);
+        }
         if (opt & 1) median3(cur, bw, bh);
         // 时间一致性：与上一对帧的矢量场轻微融合，压掉逐帧跳变
         static vector<Vec2> prevV;

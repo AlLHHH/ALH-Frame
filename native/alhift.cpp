@@ -54,6 +54,18 @@ static float g_gna = 1.0f;    // alpha2 for those rounds (smaller = sharper)
 static int g_gns = 0;         // [1 2 1] smoothing passes before those rounds
 static int g_jbu = 0;         // 1 = 矢量上采样走边缘引导（joint bilateral）
 static int g_iter = 1;        // 块匹配整体重复次数（第二轮用上一轮场做初值）
+static int g_tpred = 1;       // 1 = 用上一对帧的场做时域预测初值
+static int g_ocb = 0;        // 1 = 块场也做前后向一致性遮挡检测
+static float g_octhr = 1.5f;
+static int g_ob3 = 0;        // 1 = OBMC 用 3×3 邻块（9 个样本）
+static float g_obw = 0;      // OBMC tent 半径（像素，0=用块大小 B）
+static int g_pm = 0;          // 块级矢量传播遍数（0=关）
+static int g_pmr = 0;         // 传播时的窗半径（0=用 g_win）
+static float g_tpm = 2.0f;   // 时域初值的启用门限（上一场的平均矢量长度上限）
+static float g_ft = 0.35f;    // 场时域混合系数（0=关）
+static float g_ftd = 2.0f;    // 混合门限：新旧矢量差超过它就不混，避免拖影
+static vector<Vec2> g_prevF;
+static int g_prevW = 0, g_prevH = 0;
 static int g_bicu = 0;        // 1 = 合成采样用 Catmull-Rom，抵消亚像素 warp 的糊
 static float g_jbus = 1.0f / 144.0f;  // 灰度差权重：sigma = 12 灰阶
 static float g_dupThr = -1.f; // 去重阈值：按噪声自动定，<0 表示还没算
@@ -293,6 +305,72 @@ static float sad_at(const Img &a, const Img &b, int px, int py, int B, float vx,
         }
     }
     return n ? s / n : 1e9f;
+}
+
+// 带外扩窗的块代价（与 match_level 里的窗口一致），供块级矢量传播使用
+static float sad_win(const Img &a, const Img &b, int px, int py, int B, int r, float vx, float vy) {
+    int x0 = std::max(0, px - r), y0 = std::max(0, py - r);
+    int x1 = std::min(a.w, px + B + r), y1 = std::min(a.h, py + B + r);
+    float s = 0; int n = 0;
+    for (int y = y0; y < y1; y++) {
+        const uint8_t *ra = a.row(y);
+        for (int x = x0; x < x1; x++) {
+            s += fabsf((float)ra[x] - bilin(b, x + vx, y + vy));
+            n++;
+        }
+    }
+    return n ? s / n : 1e9f;
+}
+
+// 块级矢量传播（PatchMatch 简化版）：每个块在「自己、四邻、上下左右偏移一格」里挑代价最小的，
+// 蛇形扫描多遍。逐块独立搜索时相邻块会各挑一个互不相容的矢量，缝上就出现交叉拉链；
+// 传播让正确的矢量沿物体扩散开，错误矢量被邻居替换掉。
+static void propagate(const Img &a, const Img &b, vector<Vec2> &v, int B, int bw, int bh,
+                      int r, float pen, int passes) {
+    const int dxs[4] = {-1, 1, 0, 0}, dys[4] = {0, 0, -1, 1};
+    for (int pass = 0; pass < passes; pass++) {
+        bool fwd = (pass % 2) == 0;
+        for (int k = 0; k < bh; k++) {
+            int by = fwd ? k : bh - 1 - k;
+            for (int m = 0; m < bw; m++) {
+                int bx = fwd ? m : bw - 1 - m;
+                int px = bx * B, py = by * B;
+                Vec2 best = v[(size_t)by * bw + bx];
+                float bc = sad_win(a, b, px, py, B, r, best.x, best.y) + pen * (fabsf(best.x) + fabsf(best.y));
+                for (int d = 0; d < 4; d++) {
+                    int nx = bx + dxs[d], ny = by + dys[d];
+                    if (nx < 0 || ny < 0 || nx >= bw || ny >= bh) continue;
+                    Vec2 c = v[(size_t)ny * bw + nx];
+                    float cc = sad_win(a, b, px, py, B, r, c.x, c.y) + pen * (fabsf(c.x) + fabsf(c.y));
+                    if (cc < bc) { bc = cc; best = c; }
+                }
+                for (int d = 0; d < 4; d++) {
+                    Vec2 c{best.x + dxs[d], best.y + dys[d]};
+                    float cc = sad_win(a, b, px, py, B, r, c.x, c.y) + pen * (fabsf(c.x) + fabsf(c.y));
+                    if (cc < bc) { bc = cc; }
+                    else continue;
+                    v[(size_t)by * bw + bx] = c;
+                }
+            }
+        }
+    }
+}
+
+// 块场上的前后向一致性遮挡检测：F(p)+G(p+F(p)) 超过阈值 = 该点在这对帧之间是「出现/消失」的，
+// 合成时只能取一侧，否则两块内容叠在一起就是双影（用户看到的“奇怪的帧”）。
+static void fb_occ_block(const vector<Vec2> &F, int fw, int fh, const vector<Vec2> &G, int gw, int gh,
+                         int W, int H, int B, float thr, vector<uint8_t> &occ) {
+    occ.assign((size_t)W * H, 0);
+    for (int y = 0; y < H; y++) {
+        for (int x = 0; x < W; x++) {
+            Vec2 f = sample_vec_b(F, fw, fh, B, x, y);
+            int qx = std::min(W - 1, std::max(0, (int)lroundf(x + f.x)));
+            int qy = std::min(H - 1, std::max(0, (int)lroundf(y + f.y)));
+            Vec2 g = sample_vec_b(G, gw, gh, B, qx, qy);
+            float ex = f.x + g.x, ey = f.y + g.y;
+            if (sqrtf(ex * ex + ey * ey) > thr) occ[(size_t)y * W + x] = 1;
+        }
+    }
 }
 
 static void refine_sub(const Img &a, const Img &b, vector<Vec2> &v, int B, int bw, int bh) {
@@ -1198,6 +1276,16 @@ int main(int argc, char **argv) {
     if (const char *e = getenv("ALH_GNS")) g_gns = atoi(e);
     if (const char *e = getenv("ALH_JBU")) g_jbu = atoi(e);
     if (const char *e = getenv("ALH_ITER")) g_iter = atoi(e);
+    if (const char *e = getenv("ALH_TPRED")) g_tpred = atoi(e);
+    if (const char *e = getenv("ALH_TPM")) g_tpm = (float)atof(e);
+    if (const char *e = getenv("ALH_OCB")) g_ocb = atoi(e);
+    if (const char *e = getenv("ALH_OCT")) g_octhr = (float)atof(e);
+    if (const char *e = getenv("ALH_OB3")) g_ob3 = atoi(e);
+    if (const char *e = getenv("ALH_OBW")) g_obw = (float)atof(e);
+    if (const char *e = getenv("ALH_PM")) g_pm = atoi(e);
+    if (const char *e = getenv("ALH_PMR")) g_pmr = atoi(e);
+    if (const char *e = getenv("ALH_FT")) g_ft = (float)atof(e);
+    if (const char *e = getenv("ALH_FTD")) g_ftd = (float)atof(e);
     if (const char *e = getenv("ALH_BICU")) g_bicu = atoi(e);
     if (const char *e = getenv("ALH_HSOUT")) g_hsout = atoi(e);
     if (const char *e = getenv("ALH_HSIN")) g_hsin = atoi(e);
@@ -1303,7 +1391,8 @@ int main(int argc, char **argv) {
         if (opt & 8192) { blur3(pa[0]); blur3(pb[0]); }
         for (int l = 1; l < LEVELS; l++) { down2(pa[l - 1], pa[l]); down2(pb[l - 1], pb[l]); }
         // 粗到细块匹配（可双向：A→B 与 B→A）
-        auto mkfield = [&](vector<Img> &A, vector<Img> &Bs, vector<Vec2> &out, int &ow, int &oh) {
+        auto mkfield = [&](vector<Img> &A, vector<Img> &Bs, vector<Vec2> &out, int &ow, int &oh,
+                           bool temporal = false) {
             vector<Vec2> c2; int cw = 0, ch = 0;
             for (int rep = 0; rep < std::max(1, g_iter); rep++)
             for (int l = LEVELS - 1; l >= 0; l--) {
@@ -1313,8 +1402,22 @@ int main(int argc, char **argv) {
                 if (rep > 0) rad = 2;   // 第二轮场已经很接近，只需小半径收尾
                 int tw = (A[l].w + Bb - 1) / Bb, th = (A[l].h + Bb - 1) / Bb;
                 vector<Vec2> init;
-                if (c2.empty()) init.assign((size_t)tw * th, Vec2{0, 0});
-                else init = upsample(c2, cw, ch, tw, th);
+                if (c2.empty()) {
+                    // 时域预测：上一对帧的矢量场当最粗层初值。没有它，每对帧都从零开始搜，
+                    // 场上会逐对抖动，插出来的帧就一格一格地晃（果冻感的来源之一）。
+                    bool prevOk = false;
+                    if (!g_prevF.empty()) {
+                        // 只有上一对帧的运动本身很小（<2 px）时，才拿它的场当初值：
+                        // 运动大时旧场是过期的，会把搜索带进错误盆地（实测 1080p 直接掉 0.009）。
+                        float acc = 0;
+                        size_t cnt = g_prevF.size();
+                        for (size_t i = 0; i < cnt; i++) acc += fabsf(g_prevF[i].x) + fabsf(g_prevF[i].y);
+                        prevOk = cnt && (acc / cnt) < g_tpm;
+                    }
+                    if (g_tpred == 1 && temporal && prevOk)
+                        init = upsample(g_prevF, g_prevW, g_prevH, tw, th);
+                    else init.assign((size_t)tw * th, Vec2{0, 0});
+                } else init = upsample(c2, cw, ch, tw, th);
                 vector<Vec2> res; vector<float> cost; int rw = 0, rh = 0;
                 match_level(A[l], Bs[l], Bb, rad, init, res, cost, rw, rh);
                 c2 = res; cw = rw; ch = rh;
@@ -1390,7 +1493,7 @@ int main(int argc, char **argv) {
             // 块场细化：块匹配先定大位移，再把块矢量双线性铺到每个像素，
             // 用全分辨率 GN 迭代几轮把场抹平、补到亚像素——精度来自块匹配，
             // 连续性来自逐像素细化，块边界不会一格一格地跳。
-            mkfield(pa, pb, cur, nbw, nbh);
+            mkfield(pa, pb, cur, nbw, nbh, true);
             mkfield(pb, pa, gfield, gw, gh);
             std::vector<float> fu((size_t)W * H), fv((size_t)W * H);
             for (int y = 0; y < H; y++) {
@@ -1406,9 +1509,34 @@ int main(int argc, char **argv) {
             for (size_t i = 0; i < fu.size(); i++) cur[i] = Vec2{fu[i], fv[i]};
             nbw = W; nbh = H;
         } else {
-            mkfield(pa, pb, cur, nbw, nbh);
+            mkfield(pa, pb, cur, nbw, nbh, true);
             // 反向场始终要算：合成阶段用它做双向一致性校验，遮挡区才不会糊成重影
             mkfield(pb, pa, gfield, gw, gh);
+            if (g_tpred == 2 && !g_prevF.empty() && g_prevW == nbw && g_prevH == nbh) {
+                // 时域场当「候选」而不是初值：上一对帧的矢量若在这一块上确实更贴合，
+                // 才采纳。直接当初值会把搜索带进错误的盆地（低纹理区尤其明显）。
+                for (size_t i = 0; i < cur.size(); i++) {
+                    int bx = (int)(i % (size_t)nbw), by = (int)(i / (size_t)nbw);
+                    const int BB = std::max(1, W / std::max(1, nbw));
+                    float c0 = sad_win(pa[0], pb[0], bx * BB, by * BB, BB, g_win, cur[i].x, cur[i].y);
+                    float c1 = sad_win(pa[0], pb[0], bx * BB, by * BB, BB, g_win, g_prevF[i].x, g_prevF[i].y);
+                    if (c1 < c0 * 0.98f) cur[i] = g_prevF[i];
+                }
+            }
+            if (g_tpred == 1) {
+                // 场的时域平滑：新场与上一对帧的场按 g_ft 混合，只在两者都对得上时混，
+                // 运动突变处（差异 > g_ftd）保留新场，避免拖影。
+                if (g_ft > 0.0f && !g_prevF.empty() && g_prevW == nbw && g_prevH == nbh) {
+                    for (size_t i = 0; i < cur.size(); i++) {
+                        Vec2 &a = cur[i]; const Vec2 &b = g_prevF[i];
+                        float d = fabsf(a.x - b.x) + fabsf(a.y - b.y);
+                        float w = (d > g_ftd) ? 0.0f : g_ft;
+                        a.x = a.x * (1 - w) + b.x * w;
+                        a.y = a.y * (1 - w) + b.y * w;
+                    }
+                }
+                g_prevF = cur; g_prevW = nbw; g_prevH = nbh;
+            }
         }
         // opt&8: 在最细层再做一遍 4×4 块精修（矢量场加密，减少块状接缝）
         if (opt & 8) {
@@ -1425,6 +1553,7 @@ int main(int argc, char **argv) {
         if (opt & 16) { median3(cur, bw, bh); median3(cur, bw, bh); }   // 多遍中值：压块状拼布
         if (B > 1) {
             if (opt & 1) refine_sub(pa[0], pb[0], cur, B, bw, bh);
+            if (g_pm > 0) propagate(pa[0], pb[0], cur, B, bw, bh, g_pmr ? g_pmr : g_win, g_pen, g_pm);
             if (opt & 524288) refine_lk(pa[0], pb[0], cur, B, bw, bh, 3);
             if (opt & 1048576) refine_dense(pa[0], pb[0], cur, B, bw, bh, 3);
         }
@@ -1462,6 +1591,7 @@ int main(int argc, char **argv) {
         // 稠密光流档：用前后向一致性标出遮挡像素，合成时那里只取一侧，避免双影
         std::vector<uint8_t> occ;
         if ((opt & 1073741824) && g_occ) fb_occlusion(cur, gfield, W, H, 1.5f, occ);
+        else if (g_ocb && gw > 0) fb_occ_block(cur, nbw, nbh, gfield, gw, gh, W, H, 8, g_octhr, occ);
         const int hw = W / 2, hh = H / 2;
         const float SIG2 = 2.0f * 40.0f * 40.0f;
         // 输出本区间所有帧：t 按真实相位算，非整数倍也成立，帧数严格等于 round(N×倍率)。
@@ -1480,12 +1610,17 @@ int main(int argc, char **argv) {
                         int sgnx = (x >= bx0 * B + B / 2) ? 1 : -1;
                         int sgny = (y >= by0 * B + B / 2) ? 1 : -1;
                         int cxb[2] = {bx0, bx0 + sgnx}, cyb[2] = {by0, by0 + sgny};
-                        for (int j = 0; j < 2; j++) {
-                            for (int i = 0; i < 2; i++) {
-                                int cx = std::min(bw - 1, std::max(0, cxb[i]));
-                                int cy = std::min(bh - 1, std::max(0, cyb[j]));
+                        // 3×3 邻块 + 加宽的 tent：窗宽 = g_obw 个块（默认 1 个块），
+                        // 窗越宽，块与块之间的矢量切换越平缓，细线在缝上的台阶就越不明显。
+                        const int span = (g_ob3 > 0 ? g_ob3 - 1 : 0);   // 0=2×2, 1=3×3, 2=5×5
+                        const float tent = g_obw > 0 ? (float)g_obw : (float)B;
+                        for (int j = -span; j <= 1 + span; j++) {
+                            for (int i = -span; i <= 1 + span; i++) {
+                                int cx, cy;
+                                if (g_ob3) { cx = std::min(bw - 1, std::max(0, bx0 + i)); cy = std::min(bh - 1, std::max(0, by0 + j)); }
+                                else { if (i > 1 || j > 1) continue; cx = std::min(bw - 1, std::max(0, cxb[i])); cy = std::min(bh - 1, std::max(0, cyb[j])); }
                                 float ccx = cx * B + B * 0.5f, ccy = cy * B + B * 0.5f;
-                                float wk = (1.0f - fabsf((float)x - ccx) / B) * (1.0f - fabsf((float)y - ccy) / B);
+                                float wk = (1.0f - fabsf((float)x - ccx) / tent) * (1.0f - fabsf((float)y - ccy) / tent);
                                 if (wk <= 0.02f) continue;
                                 Vec2 v = cur[(size_t)cy * bw + cx];
                                 float ax = x - v.x * t, ay = y - v.y * t;

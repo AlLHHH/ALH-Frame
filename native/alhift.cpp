@@ -39,7 +39,7 @@ static void down2(const Img &s, Img &d) {
 struct Vec2 { float x, y; };
 
 // 单层块匹配：以 init 矢量为中心做 ±rad 搜索，块大小 B，返回整像素最优位移
-static float g_pen = 0.25f;   // 每像素每位移的惩罚（ffmpeg 等效值 0.25 灰阶/px）
+static float g_pen = 0.08f;   // 每像素每位移的惩罚（ffmpeg 等效值 0.25 灰阶/px）
 static int g_win = 2;         // 窗比块每边外扩像素（B=8 → 12×12 窗；比整块 SAD 稳，又不像 2×mb 那么贵）
 static int g_fit = 8;        // 全分辨率光流迭代次数（2/4/6/8 → 0.9431/0.9435/0.9437/0.9438）
 static float g_fal = 0.15f;
@@ -110,6 +110,19 @@ static void match_level(const Img &a, const Img &b, int B, int rad,
                 int px = bx * B, py = by * B;
                 Vec2 iv = init[(size_t)by * nx + bx];
                 int cx = (int)lroundf(iv.x), cy = (int)lroundf(iv.y);
+                // 纹理强度决定惩罚力度：强边缘块上 SAD 有区分度，惩罚会把位移系统性缩短
+                // （实测 10px 平移被估成 8px，中间帧位置偏 20%）；平坦块上 SAD 无区分度，
+                // 反而要靠惩罚把矢量压回预测，避免乱跳。
+                float vsum = 0, vsum2 = 0; int vn = 0;
+                for (int y = py; y < std::min(py + B, a.h); y += 2) {
+                    const uint8_t *row = a.row(y);
+                    for (int x = px; x < std::min(px + B, a.w); x += 2) {
+                        float v = (float)row[x];
+                        vsum += v; vsum2 += v * v; vn++;
+                    }
+                }
+                float var = vn ? std::max(0.0f, vsum2 / vn - (vsum / vn) * (vsum / vn)) : 0.0f;
+                float pen = g_pen / (1.0f + var / 60.0f);
                 float best = 1e9f; int bdx = 0, bdy = 0;
                 // 先在初始矢量处算一次
                 for (int pass = 0; pass < 2; pass++) {
@@ -137,7 +150,7 @@ static void match_level(const Img &a, const Img &b, int B, int rad,
                             // 匹配代价惩罚（等效 ffmpeg 的 64×L1 预测惩罚；系数可用 ALH_PEN 覆盖）
                             long npix = (long)(y1_ - y0_) * (x1 - x0);
                             int ftop = (fabsf((float)sx) + fabsf((float)sy));
-                            float c = (float)sad / (float)npix + g_pen * (float)ftop;
+                            float c = (float)sad / (float)npix + pen * (float)ftop;
                             if (c < best) { best = c; bdx = sx; bdy = sy; }
                         }
                     }

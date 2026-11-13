@@ -1605,6 +1605,42 @@ int main(int argc, char **argv) {
         std::vector<uint8_t> occ;
         if ((opt & 1073741824) && g_occ) fb_occlusion(cur, gfield, W, H, 1.5f, occ);
         else if (g_ocb && gw > 0) fb_occ_block(cur, nbw, nbh, gfield, gw, gh, W, H, 8, g_octhr, occ);
+
+        // 前后向一致性图（先算再平滑）：逐像素 exp(-fb²/σ²) 会在遮挡边界上跳变，
+        // 不做空间平滑的话合成权重一顿一顿，观感就是闪烁。
+        std::vector<float> fbsm; int fbmw = 0, fbmh = 0;
+        if ((opt & 4194304) && gw > 0) {
+            std::vector<float> raw((size_t)W * H, 9.0f);
+            for (int y = 0; y < H; y++) {
+                for (int x = 0; x < W; x++) {
+                    Vec2 v = sample_vec_b(cur, nbw, nbh, 1, (float)x, (float)y);
+                    float ax = x - v.x, ay = y - v.y;
+                    float bx = x + v.x, by = y + v.y;
+                    float fb = 9.0f;
+                    if (ax >= 0 && ay >= 0 && ax <= W - 1 && ay <= H - 1) {
+                        Vec2 g = sample_vec_b(gfield, gw, gh, 1, std::min(W - 1.f, std::max(0.f, bx)), std::min(H - 1.f, std::max(0.f, by)));
+                        float ex = v.x + g.x, ey = v.y + g.y;
+                        fb = sqrtf(ex * ex + ey * ey);
+                    }
+                    raw[(size_t)y * W + x] = fb;
+                }
+            }
+            fbsm.assign((size_t)W * H, 9.0f);
+            for (int y = 0; y < H; y++) {
+                for (int x = 0; x < W; x++) {
+                    float sum = 0; int n = 0;
+                    for (int j = -1; j <= 1; j++) {
+                        int yy = y + j; if (yy < 0 || yy >= H) continue;
+                        for (int i = -1; i <= 1; i++) {
+                            int xx = x + i; if (xx < 0 || xx >= W) continue;
+                            sum += raw[(size_t)yy * W + xx]; n++;
+                        }
+                    }
+                    fbsm[(size_t)y * W + x] = n ? sum / n : 9.0f;
+                }
+            }
+            fbmw = W; fbmh = H;
+        }
         const int hw = W / 2, hh = H / 2;
         const float SIG2 = 2.0f * 40.0f * 40.0f;
         // 输出本区间所有帧：t 按真实相位算，非整数倍也成立，帧数严格等于 round(N×倍率)。
@@ -1692,6 +1728,28 @@ int main(int argc, char **argv) {
                     float val;
                     if (wsum <= 1e-4f) {
                         val = tm;
+                    } else if (opt & 4194304) {
+                        // 双向稠密光流合成（NodeVideo 那一路）：可见性由前后向一致性
+                        // |F(p)+G(p+F)| 给出，误差小=两侧都能看见=按 t 混合；误差大=一侧被遮挡，
+                        // 只信另一侧。系数取流场尺度（1.5px），不是灰度尺度。
+                        Vec2 v = sample_vec_b(cur, bw, bh, 1, (float)x, (float)y);
+                        float ax = x - v.x * t, ay = y - v.y * t;
+                        float bxp = x + v.x * (1 - t), byp = y + v.y * (1 - t);
+                        bool i0 = ax >= 0 && ay >= 0 && ax <= W - 1 && ay <= H - 1;
+                        bool i1 = bxp >= 0 && byp >= 0 && bxp <= W - 1 && byp <= H - 1;
+                        P0 = i0 ? bicu(a, ax, ay) : bilin(a, (float)x, (float)y);
+                        P1 = i1 ? bicu(b, bxp, byp) : bilin(b, (float)x, (float)y);
+                        float fb0 = 9.0f;
+                        if (fbmw > 0) {
+                            int qx = std::min(W - 1, std::max(0, (int)lroundf(x + v.x)));
+                            int qy = std::min(H - 1, std::max(0, (int)lroundf(y + v.y)));
+                            fb0 = fbsm[(size_t)qy * W + qx];
+                        }
+                        const float S2 = 2.0f * 2.5f * 2.5f;
+                        float V0 = expf(-fb0 * fb0 / S2), V1 = V0;
+                        float a0 = (1 - t) * V0, a1 = t * V1, Z = a0 + a1;
+                        if (i0 && i1 && Z > 0.02f) val = (P0 * a0 + P1 * a1) / Z;
+                        else val = (t < 0.5f ? P0 : P1);
                     } else if (opt & 2097152) {
                         // Super SloMo 式可见性加权：两侧各自的置信度必须分开保留，
                         // 否则归一化会把置信度整体约掉（老 bug）。V0/V1 用「warp 回原位置是否还对得上」来量。

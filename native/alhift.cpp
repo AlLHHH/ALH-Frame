@@ -50,6 +50,12 @@ static int g_dp = 0;
 static float g_dms = 2.0f;    // DIS patch 每轮位移上限（大位移靠这个放开）
 static int g_dpe = 0;         // DIS 最细层额外 patch 遍数（P=8/step=2/maxstep=0.5）
 static float g_dupThr = -1.f; // 去重阈值：按噪声自动定，<0 表示还没算
+static int g_lv = 6;          // 稠密光流金字塔最大层数（调参用）
+static int g_lvmed = 1;       // 层间矢量场上采样后做 3x3 分量中值（1=开）
+static int g_resid = 1;       // 层间改造：warp 掉已有位移，只解残差（1=开）
+static int g_pass = 3;        // 每层 patch 迭代遍数（调参用）
+static int g_seed = 8;        // 最粗层全局平移种子搜索半径（0=关）
+static int g_cos = 0;         // 混合权重用余弦缓动（1=开）
 
 // 噪声估计：拉普拉斯响应的 MAD/6 ≈ 高斯噪声 σ（灰阶）
 static float y_sigma(const Img &a) {
@@ -197,6 +203,33 @@ static inline Vec2 sample_vec_b(const vector<Vec2> &v, int bw, int bh, int B, in
     r.x = (p00.x * (1 - ax) + p10.x * ax) * (1 - ay) + (p01.x * (1 - ax) + p11.x * ax) * ay;
     r.y = (p00.y * (1 - ax) + p10.y * ax) * (1 - ay) + (p01.y * (1 - ax) + p11.y * ax) * ay;
     return r;
+}
+
+// Catmull-Rom 三次卷积采样：光流档合成用，抵消亚像素 warp 带来的糊。
+static inline float bicu(const Img &im, float x, float y) {
+    int x0 = (int)floorf(x), y0 = (int)floorf(y);
+    float fx = x - x0, fy = y - y0;
+    auto w = [](float f, float *k) {
+        float f2 = f * f, f3 = f2 * f;
+        k[0] = -0.5f * f3 + f2 - 0.5f * f;
+        k[1] = 1.5f * f3 - 2.5f * f2 + 1.0f;
+        k[2] = -1.5f * f3 + 2.0f * f2 + 0.5f * f;
+        k[3] = 0.5f * f3 - 0.5f * f2;
+    };
+    float kx[4], ky[4];
+    w(fx, kx); w(fy, ky);
+    float s = 0.f;
+    for (int j = 0; j < 4; j++) {
+        int yy = std::max(0, std::min(im.h - 1, y0 - 1 + j));
+        const uint8_t *row = im.row(yy);
+        float r = 0.f;
+        for (int i = 0; i < 4; i++) {
+            int xx = std::max(0, std::min(im.w - 1, x0 - 1 + i));
+            r += kx[i] * (float)row[xx];
+        }
+        s += ky[j] * r;
+    }
+    return std::max(0.f, std::min(255.f, s));
 }
 
 static inline float bilin(const Img &im, float x, float y) {
@@ -872,7 +905,10 @@ static void flow_hs(const Img &A, const Img &B, std::vector<Vec2> &out) {
 // DIS 式稠密光流：多尺度 patch 逆向搜索（Gauss-Newton 用块内 Hessian 预解）
 // + 每层变分细化（逐像素 GN + 场平滑）。语义与其它场一致：b(x+u) ≈ a(x)。
 // ---------------------------------------------------------------------------
-static void upf(const std::vector<float> &s, int sw, int sh, std::vector<float> &d, int dw, int dh) {
+// 注意：粗到细放大时必须同时把矢量长度乘上放大倍数（mag），否则每层运动量会减半，
+// 表现就是「越细化越把正确运动压回去」。
+static void upf(const std::vector<float> &s, int sw, int sh, std::vector<float> &d, int dw, int dh,
+                float mag) {
     d.assign((size_t)dw * dh, 0.f);
     for (int y = 0; y < dh; y++) {
         float fy = ((y + 0.5f) * sh / dh) - 0.5f;
@@ -886,7 +922,8 @@ static void upf(const std::vector<float> &s, int sw, int sh, std::vector<float> 
             float ax = std::max(0.f, std::min(1.f, fx - x0));
             float v00 = s[(size_t)y0 * sw + x0], v01 = s[(size_t)y0 * sw + x1];
             float v10 = s[(size_t)y1 * sw + x0], v11 = s[(size_t)y1 * sw + x1];
-            d[(size_t)y * dw + x] = (v00 * (1 - ax) + v01 * ax) * (1 - ay) + (v10 * (1 - ax) + v11 * ax) * ay;
+            d[(size_t)y * dw + x] = ((v00 * (1 - ax) + v01 * ax) * (1 - ay) +
+                                    (v10 * (1 - ax) + v11 * ax) * ay) * mag;
         }
     }
 }
@@ -937,10 +974,62 @@ static void patch_pass(const Img &a, const Img &b, std::vector<float> &u, std::v
     tri_smooth(v, w, h);
 }
 
+static void fm3(std::vector<float> &f, int w, int h) {
+    std::vector<float> src = f;
+    float b[9];
+    for (int y = 0; y < h; y++)
+        for (int x = 0; x < w; x++) {
+            int n = 0;
+            for (int dy = -1; dy <= 1; dy++)
+                for (int dx = -1; dx <= 1; dx++) {
+                    int xx = std::max(0, std::min(w - 1, x + dx));
+                    int yy = std::max(0, std::min(h - 1, y + dy));
+                    b[n++] = src[(size_t)yy * w + xx];
+                }
+            std::sort(b, b + 9);
+            f[(size_t)y * w + x] = b[4];
+        }
+}
+
+// 用当前矢量场把 b 反向 warp 成「对齐到 a 的样子」：a(x) ≈ b(x + u(x))
+static void warp_img(const Img &b, const std::vector<float> &u, const std::vector<float> &v, Img &out) {
+    out.alloc(b.w, b.h);
+    for (int y = 0; y < b.h; y++)
+        for (int x = 0; x < b.w; x++) {
+            size_t i = (size_t)y * b.w + x;
+            out.row(y)[x] = (uint8_t)std::max(0.0f, std::min(255.0f,
+                bilin(b, x + u[i], y + v[i]) + 0.5f));
+        }
+}
+
+// 全局平移种子：在最粗层上做 ±R 的整数穷举（4 像素抽样），把主运动直接给到场里，
+// 免得粗层梯度过弱时从 0 起步、层层只捡到一半运动量。
+static float global_seed(const Img &a, const Img &b, int R, float &gu, float &gv) {
+    gu = gv = 0.f;
+    long best = -1, zero = -1;
+    for (int dy = -R; dy <= R; dy++)
+        for (int dx = -R; dx <= R; dx++) {
+            long sad = 0; int cnt = 0;
+            for (int y = R; y < a.h - R; y += 4)
+                for (int x = R; x < a.w - R; x += 4) {
+                    int xx = x + dx, yy = y + dy;
+                    if (xx < 0 || yy < 0 || xx >= a.w || yy >= a.h) continue;
+                    sad += std::abs((int)a.row(y)[x] - (int)b.row(yy)[xx]);
+                    cnt++;
+                }
+            if (cnt == 0) continue;
+            long v = sad * 100 / cnt;
+            if (dx == 0 && dy == 0) zero = v;
+            if (best < 0 || v < best) { best = v; gu = (float)dx; gv = (float)dy; }
+        }
+    if (best < 0 || zero <= 0) return 0.f;
+    return (float)best / (float)zero;   // <1 表示比「不动」更好；越小越可信
+}
+
 static void flow_dis(const Img &A, const Img &B, std::vector<Vec2> &out) {
     std::vector<Img> pa, pb;
     pa.push_back(A); pb.push_back(B);
-    while ((int)pa.size() < 6 && std::min(pa.back().w, pa.back().h) > 48) {
+    while ((int)pa.size() < g_lv && std::min(pa.back().w, pa.back().h) > 48) {
         Img na, nb;
         down2(pa.back(), na); down2(pb.back(), nb);
         pa.push_back(na); pb.push_back(nb);
@@ -950,18 +1039,57 @@ static void flow_dis(const Img &A, const Img &B, std::vector<Vec2> &out) {
     std::vector<float> u, v;
     for (int l = L - 1; l >= 0; l--) {
         const Img &a = pa[l], &b = pb[l];
-        if (pw == 0) { u.assign((size_t)a.w * a.h, 0.f); v.assign((size_t)a.w * a.h, 0.f); }
-        else { std::vector<float> nu, nv; upf(u, pw, ph, nu, a.w, a.h); upf(v, pw, ph, nv, a.w, a.h); u.swap(nu); v.swap(nv); }
+        if (pw == 0) {
+            u.assign((size_t)a.w * a.h, 0.f); v.assign((size_t)a.w * a.h, 0.f);
+            if (g_seed) {
+                float gu, gv;
+                float rel = global_seed(a, b, g_seed, gu, gv);
+                if (rel > 0.f && rel < 0.85f) {
+                    for (size_t q = 0; q < u.size(); q++) { u[q] = gu; v[q] = gv; }
+                    if (a.w == pa[L - 1].w)
+                        fprintf(stderr, "seed=(%.0f,%.0f) gain=%.2f\n", gu, gv, rel);
+                }
+            }
+        }
+        else {
+            std::vector<float> nu, nv;
+            upf(u, pw, ph, nu, a.w, a.h, (float)a.w / (float)pw);
+            upf(v, pw, ph, nv, a.w, a.h, (float)a.h / (float)ph);
+            u.swap(nu); v.swap(nv);
+            // 上采样是双线性，平坦区会把邻域的 0 摊进来；分量中值能把周围有效矢量顶回来
+            if (g_lvmed) { fm3(u, a.w, a.h); fm3(v, a.w, a.h); }
+        }
         // 粗层大步长、细层小步长；patch 尺寸随层收缩，两次错位网格保证覆盖
-        fprintf(stderr, "dis lvl=%d %dx%d\n", l, a.w, a.h);
+        std::vector<float> mags;
+        for (size_t q = 0; q < u.size(); q += 7) mags.push_back(std::fabs(u[q]));
+        std::sort(mags.begin(), mags.end());
+        float p50 = mags.empty() ? 0.f : mags[mags.size() / 2];
+        fprintf(stderr, "dis lvl=%d %dx%d p50=%.2f\n", l, a.w, a.h, p50);
         int P = (l == L - 1) ? 16 : (l == L - 2 ? 12 : 8);
-        patch_pass(a, b, u, v, P, P / 2, g_dms);
-        patch_pass(a, b, u, v, P, std::max(2, P / 4), g_dms * 0.75f);
-        patch_pass(a, b, u, v, P, std::max(2, P / 4), 1.0f);
-        for (int it = 0; it < (l == 0 ? g_dit : 3); it++)
-            flow_level(a, b, u, v, 2, (l == 0) ? g_da : 1.2f);
-        for (int e = 0; e < (l == 0 ? g_dp : 0); e++)
-            patch_pass(a, b, u, v, 8, 2, 0.5f);
+        if (!g_resid) {
+            patch_pass(a, b, u, v, P, P / 2, g_dms);
+            for (int q = 0; q < std::max(1, g_pass - 1); q++)
+                patch_pass(a, b, u, v, P, std::max(2, P / 4), g_dms);
+            for (int it = 0; it < (l == 0 ? g_dit : 3); it++)
+                flow_level(a, b, u, v, 2, (l == 0) ? g_da : 1.2f);
+            for (int e = 0; e < (l == 0 ? g_dp : 0); e++)
+                patch_pass(a, b, u, v, 8, 2, 0.5f);
+        } else {
+            // 残差式：先把 b 按当前矢量 warp 对齐，再只用小步长解剩余误差，
+            // 避免 7px 残差超出线性化半径后每轮只挪 0.5px。
+            Img bw;
+            warp_img(b, u, v, bw);
+            std::vector<float> ru((size_t)a.w * a.h, 0.f), rv((size_t)a.w * a.h, 0.f);
+            float cap = (l == L - 1) ? g_dms : 1.0f;
+            patch_pass(a, bw, ru, rv, P, P / 2, cap);
+            for (int q = 0; q < std::max(1, g_pass - 1); q++)
+                patch_pass(a, bw, ru, rv, P, std::max(2, P / 4), cap);
+            for (int it = 0; it < (l == 0 ? g_dit : 3); it++)
+                flow_level(a, bw, ru, rv, 2, (l == 0) ? g_da : 1.2f);
+            for (size_t i = 0; i < u.size(); i++) { u[i] += ru[i]; v[i] += rv[i]; }
+            for (int e = 0; e < (l == 0 ? g_dp : 0); e++)
+                patch_pass(a, bw, ru, rv, 8, 2, 0.5f);
+        }
         pw = a.w; ph = a.h;
     }
     out.resize((size_t)A.w * A.h);
@@ -1012,6 +1140,12 @@ int main(int argc, char **argv) {
     if (const char *e = getenv("ALH_DP")) g_dp = atoi(e);
     if (const char *e = getenv("ALH_DMS")) g_dms = (float)atof(e);
     if (const char *e = getenv("ALH_DUP")) g_dupThr = (float)atof(e);
+    if (const char *e = getenv("ALH_LV")) g_lv = atoi(e);
+    if (const char *e = getenv("ALH_LVMED")) g_lvmed = atoi(e);
+    if (const char *e = getenv("ALH_RESID")) g_resid = atoi(e);
+    if (const char *e = getenv("ALH_PASS")) g_pass = atoi(e);
+    if (const char *e = getenv("ALH_SEED")) g_seed = atoi(e);
+    if (const char *e = getenv("ALH_COS")) g_cos = atoi(e);
     if (const char *e = getenv("ALH_OFRES")) g_ofres = atoi(e);
     if (const char *e = getenv("ALH_HSOUT")) g_hsout = atoi(e);
     if (const char *e = getenv("ALH_HSIN")) g_hsin = atoi(e);
@@ -1294,8 +1428,8 @@ int main(int argc, char **argv) {
                                     float rr = sqrtf(ex * ex + ey * ey);
                                     trust = 1.0f / (1.0f + rr * rr * 0.25f);
                                 }
-                                P0 += bilin(a, ax, ay) * wk;
-                                P1 += bilin(b, bxp, byp) * wk * trust;
+                                P0 += (opt & 1073741824 ? bicu(a, ax, ay) : bilin(a, ax, ay)) * wk;
+                                P1 += (opt & 1073741824 ? bicu(b, bxp, byp) : bilin(b, bxp, byp)) * wk * trust;
                                 wsum += wk;
                                 w0s += wk;
                                 w1s += wk * trust;
@@ -1311,7 +1445,11 @@ int main(int argc, char **argv) {
                         float bxp = x + v.x * (1 - t), byp = y + v.y * (1 - t);
                         bool i0 = ax >= 0 && ay >= 0 && ax <= W - 1 && ay <= H - 1;
                         bool i1 = bxp >= 0 && byp >= 0 && bxp <= W - 1 && byp <= H - 1;
-                        if (i0 && i1) { P0 = bilin(a, ax, ay); P1 = bilin(b, bxp, byp); wsum = 1.0f; }
+                        if (i0 && i1) {
+                            if (opt & 1073741824) { P0 = bicu(a, ax, ay); P1 = bicu(b, bxp, byp); }
+                            else { P0 = bilin(a, ax, ay); P1 = bilin(b, bxp, byp); }
+                            wsum = 1.0f;
+                        }
                         else if (i0) { P0 = bilin(a, ax, ay); P1 = P0; wsum = 1.0f; }
                         else if (i1) { P1 = bilin(b, bxp, byp); P0 = P1; wsum = 1.0f; }
                     }
@@ -1348,7 +1486,9 @@ int main(int argc, char **argv) {
                         float a0 = (1 - t) * V0, a1 = t * V1, Z = a0 + a1;
                         val = (Z < 0.05f) ? tm : (P0 * a0 + P1 * a1) / Z;
                     } else {
-                        float mx = P0 * (1 - t) + P1 * t;
+                        // 余弦缓动：两端更「靠边」、中点更接近线性，边缘区不易拉花
+                        float tw = g_cos ? 0.5f - 0.5f * cosf(3.14159265f * t) : t;
+                        float mx = P0 * (1 - tw) + P1 * tw;
                         if (opt & 16384) {
                             // 两侧 warp 的差就是「这一点到底能不能信矢量」的度量。
                             // 差得越大越可能是遮挡或错矢量，连续地退回同时刻平均（不硬切换，才不闪）。

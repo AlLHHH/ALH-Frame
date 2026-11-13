@@ -6,6 +6,7 @@ import android.content.ClipData;
 import android.content.ClipboardManager;
 import android.content.Intent;
 import android.content.pm.PackageManager;
+import android.content.res.ColorStateList;
 import android.graphics.Bitmap;
 import android.graphics.Matrix;
 import android.graphics.drawable.Drawable;
@@ -66,7 +67,8 @@ public class MainActivity extends Activity {
     boolean dedup = false;
     TextView tvEngine;
     TextView tvEngineNote;
-    Button btnDedup;
+    LinearLayout rowDedup;
+    Toggle swDedup;
     Button btnCancel;
     Bar bar;
     LinearLayout boxProgress;
@@ -300,16 +302,25 @@ public class MainActivity extends Activity {
         tvEngineNote.setLineSpacing(dp(2), 1f);
         col.addView(tvEngineNote, lp(-1, -2, dp(2), dp(6), 0, 0));
 
-        btnDedup = button("去重复帧 关", false);
-        btnDedup.setOnClickListener(new View.OnClickListener() {
-            public void onClick(View v) {
+        // 去重复帧：左右滑动的开关（Lite 档不显示，那个档走 ffmpeg，没有这个功能）
+        rowDedup = new LinearLayout(this);
+        rowDedup.setOrientation(LinearLayout.HORIZONTAL);
+        rowDedup.setGravity(android.view.Gravity.CENTER_VERTICAL);
+        TextView lb = text("去重复帧", 14, C_TEXT, false);
+        rowDedup.addView(lb, new LinearLayout.LayoutParams(0, -2, 1f));
+        swDedup = new Toggle(this);
+        swDedup.setOn(dedup);
+        swDedup.setOnChange(new Toggle.OnChange() {
+            public void onChange(boolean on) {
                 if (running) {
+                    swDedup.setOn(dedup, true);
                     return;
                 }
-                setDedup(!dedup);
+                dedup = on;
             }
         });
-        col.addView(btnDedup, lp(-1, dp(44), 0, dp(6), 0, dp(24)));
+        rowDedup.addView(swDedup, new LinearLayout.LayoutParams(-2, -2));
+        col.addView(rowDedup, lp(-1, dp(44), dp(2), dp(2), 0, dp(22)));
         setEngine(0);
 
         btnStart = button("开始处理", true);
@@ -556,26 +567,22 @@ public class MainActivity extends Activity {
             }
             tvEngineNote.setText(note);
         }
-        if (btnDedup != null) {
+        if (rowDedup != null) {
             // 去重复帧是自研内核的开关，Lite 上不显示，免得看成对 ffmpeg 也能用
-            btnDedup.setVisibility(e != 0 ? View.VISIBLE : View.GONE);
-            btnDedup.setEnabled(e != 0);
-            btnDedup.setTextColor(e != 0 ? (dedup ? -1 : C_TEXT) : C_DIM);
-            btnDedup.setBackground(round(e != 0 && dedup ? C_ACC : C_OFF, dp(12)));
-            btnDedup.setText(dedup ? "去重复帧 开" : "去重复帧 关");
+            rowDedup.setVisibility(e != 0 ? View.VISIBLE : View.GONE);
+            swDedup.setEnabled(e != 0);
+            swDedup.setAlpha(e != 0 ? 1f : 0.4f);
             if (e == 0) {
                 dedup = false;
-                btnDedup.setText("去重复帧 关");
+                swDedup.setOn(false, false);
             }
         }
     }
 
     private void setDedup(boolean on) {
         dedup = on;
-        if (btnDedup != null) {
-            btnDedup.setText(on ? "去重复帧 开" : "去重复帧 关");
-            btnDedup.setBackground(round(on ? C_ACC : C_OFF, dp(12)));
-            btnDedup.setTextColor(on ? -1 : C_TEXT);
+        if (swDedup != null && swDedup.isOn() != on) {
+            swDedup.setOn(on, true);
         }
     }
 
@@ -607,8 +614,8 @@ public class MainActivity extends Activity {
             tvEngine.setEnabled(false);
             tvEngine.setTextColor(C_DIM);
         }
-        if (btnDedup != null) {
-            btnDedup.setEnabled(false);
+        if (swDedup != null) {
+            swDedup.setEnabled(false);
         }
         boxProgress.setVisibility(View.VISIBLE);
         bar.setVisibility(View.VISIBLE);
@@ -703,8 +710,9 @@ public class MainActivity extends Activity {
             tvEngine.setEnabled(true);
             tvEngine.setTextColor(C_TEXT);
         }
-        if (btnDedup != null) {
-            btnDedup.setEnabled(engineMode != 0);
+        if (swDedup != null) {
+            swDedup.setEnabled(engineMode != 0);
+            swDedup.setAlpha(engineMode != 0 ? 1f : 0.4f);
         }
         btnCancel.setVisibility(View.GONE);
         getWindow().clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);

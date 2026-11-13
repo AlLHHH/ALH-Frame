@@ -559,9 +559,9 @@ public class MainActivity extends Activity {
             } else if (e == 1) {
                 note = "自研内核：块匹配，速度快，细节更锐。";
             } else if (e == 2) {
-                note = "自研内核：块匹配 + 亚像素精修，慢一点，运动边缘更连续。";
+                note = "自研光流：流场先在低分辨率上解算再逐像素融合，边缘平滑，速度快。";
             } else {
-                note = "自研光流：流场在低分辨率上解算再逐像素融合，无方格，约为标准档一半耗时。";
+                note = "质量优先：块匹配 + 亚像素精修 + 宽窗搜索，速度约为标准档一半，复杂运动更稳。";
             }
             tvEngineNote.setText(note);
         }

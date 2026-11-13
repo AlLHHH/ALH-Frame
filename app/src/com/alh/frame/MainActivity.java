@@ -481,11 +481,11 @@ public class MainActivity extends Activity {
     static final String[][] ENGINE_VERS = {
             {"v1"},
             {"v1", "v2"},
-            {"v1", "v2"}};
+            {"v1"}};
     static final int[][] ENGINE_CODES = {
             {0},
             {1, 2},
-            {3, 4}};
+            {3}};
 
     static int typeOf(int code) {
         return code == 0 ? 0 : (code <= 2 ? 1 : 2);
@@ -560,10 +560,8 @@ public class MainActivity extends Activity {
                 note = "自研内核：块匹配，速度快，细节更锐。";
             } else if (e == 2) {
                 note = "自研内核：块匹配 + 亚像素精修，慢一点，运动边缘更连续。";
-            } else if (e == 3) {
-                note = "自研光流：流场在低分辨率上解算再逐像素融合，无方格，约为标准档一半耗时。";
             } else {
-                note = "自研光流 v2：逐像素稠密流场 + 前后向遮挡判断，过渡最连续，速度最慢。";
+                note = "自研光流：流场在低分辨率上解算再逐像素融合，无方格，约为标准档一半耗时。";
             }
             tvEngineNote.setText(note);
         }

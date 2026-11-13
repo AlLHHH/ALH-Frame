@@ -41,6 +41,8 @@ struct Vec2 { float x, y; };
 // 单层块匹配：以 init 矢量为中心做 ±rad 搜索，块大小 B，返回整像素最优位移
 static float g_pen = 0.25f;   // 每像素每位移的惩罚（ffmpeg 等效值 0.25 灰阶/px）
 static int g_win = 2;         // 窗比块每边外扩像素（B=8 → 12×12 窗；比整块 SAD 稳，又不像 2×mb 那么贵）
+static int g_fit = 8;        // 全分辨率光流迭代次数（2/4/6/8 → 0.9431/0.9435/0.9437/0.9438）
+static float g_fal = 0.15f;   // 全分辨率光流平滑系数
 
 // 噪声估计：拉普拉斯响应的 MAD/6 ≈ 高斯噪声 σ（灰阶）
 static float y_sigma(const Img &a) {
@@ -614,8 +616,8 @@ static void flow_dense(const std::vector<Img> &pa, const std::vector<Img> &pb, i
                 fv[(size_t)y * W + x] = 2.0f * ((at(x0, y0, 0) * (1 - ax) + at(x0 + 1, y0, 0) * ax) * (1 - ay)
                                               + (at(x0, y0 + 1, 0) * (1 - ax) + at(x0 + 1, y0 + 1, 0) * ax) * ay);
             }
-        for (int it = 0; it < 2; it++) {
-            flow_level(pa[0], pb[0], fu, fv, 1, 0.4f);
+        for (int it = 0; it < g_fit; it++) {
+            flow_level(pa[0], pb[0], fu, fv, 1, g_fal);
         }
         out.assign((size_t)W * H, Vec2{0, 0});
         for (size_t i = 0; i < out.size(); i++) out[i] = Vec2{fu[i], fv[i]};
@@ -658,6 +660,8 @@ int main(int argc, char **argv) {
     bool penFixed = false;
     if (const char *e = getenv("ALH_PEN")) { g_pen = (float)atof(e); penFixed = true; }
     if (const char *e = getenv("ALH_WIN")) g_win = atoi(e);
+    if (const char *e = getenv("ALH_FIT")) g_fit = atoi(e);
+    if (const char *e = getenv("ALH_FAL")) g_fal = (float)atof(e);
     size_t ysz = (size_t)W * H, csz = (size_t)(W / 2) * (H / 2);
     size_t fsz = ysz + 2 * csz;
 
@@ -777,6 +781,23 @@ int main(int argc, char **argv) {
                 // 这一档不在全分辨率上写整块矢量——整块写回就是画面上那些方格。
                 vector<Vec2> dense;
                 flow_dense(pa, pb, W, H, dense, nullptr, 0, 0, 8);
+                if (opt & 67108864) {
+                    // 双向一致性加权的混合场：光流在纹理丰富处准，块场在大位移处稳。
+                    // 前向流 F 与反向流 G 应当互为逆，|F(p)+G(p+F(p))| 小说明这一点可信，
+                    // 用这个残差做权重；两场都是连续的，混完仍然没有方格。
+                    const float TAU = 2.2f, IT = 1.0f / (2.0f * TAU * TAU);
+                    for (int y = 0; y < H; y++) {
+                        for (int x = 0; x < W; x++) {
+                            size_t i = (size_t)y * W + x;
+                            Vec2 f = dense[i];
+                            Vec2 g = sample_vec_b(gfield, gw, gh, 8, x + f.x, y + f.y);
+                            float rx = f.x + g.x, ry = f.y + g.y;
+                            float c = expf(-(rx * rx + ry * ry) * IT);
+                            Vec2 bs = sample_vec_b(cur, nbw, nbh, 8, (float)x, (float)y);
+                            dense[i] = Vec2{c * f.x + (1 - c) * bs.x, c * f.y + (1 - c) * bs.y};
+                        }
+                    }
+                }
                 cur.swap(dense);
             }
             nbw = W; nbh = H;

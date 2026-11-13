@@ -110,6 +110,16 @@ ffmpeg -ss .. -t .. -i src -an -f rawvideo -pix_fmt yuv420p -
 
 低分辨率下 Pro 领先约 3.8 dB，速度还快一倍；720p 上还差 Lite 约 3 dB，差距集中在运动区的矢量精度（运动区平均误差 3.64 对 1.86，静止区反而更好：0.67 对 0.84）。试过双向场、多假设、4×4 精修、16px 块、更大搜索半径，全部没有正收益，所以这一版把 Pro 定位成「低分辨率与老片更清楚、更快」，高分辨率继续用 Lite。Pro 某一段跑不动时会自动退到 Lite 出片，不让任务整体失败。
 
+### 第三档：Standard v2（稠密光流）
+
+同一份核心里多一条逐像素路线：先用块匹配拿到大位移，再在 1/8→1/2 分辨率上做高斯-牛顿光流迭代（每轮 [1 2 1] 平滑一次），最后回到全分辨率细化两轮。矢量场连续，边缘和渐变的过渡更顺，代价是细节略软。
+
+| 素材 | Standard（块匹配） | Standard v2（光流） | Lite | 耗时 v2 / Standard |
+| --- | --- | --- | --- | --- |
+| foreman 352×288 实拍 15→30 | 0.9497 | 0.9433 | 0.9486 | 4.4 s / 2.1 s |
+
+在真实拍摄的 foreman 上，光流档比块匹配低 0.006 SSIM，速度慢一倍多。按「效果够好且慢得不多才升 Pro」的标准，它还不够格，所以挂成第三档实验项，界面上如实标注。想试的话：下拉 → `ALH Frame Standard v2`。
+
 ## 功能
 
 | 项 | 说明 |
@@ -120,7 +130,7 @@ ffmpeg -ss .. -t .. -i src -an -f rawvideo -pix_fmt yuv420p -
 | 输出 | `Movies/ALH Frame/ALHFrame_<时间戳>_<倍率>x.mp4`，H.264 High，CRF 19，yuv420p，`+faststart` |
 | 进度 | 逐帧显示「第 N / 总数 帧」，多路并发时按已完成帧数累计 |
 | 日志 | 右上角「日志」，滚动保留最近 5 MB，可复制、可清空 |
-| 引擎 | `ALH Frame Lite` 走 ffmpeg `minterpolate`；`ALH Frame Standard` 走自研 C++ 内核（见下节） |
+| 引擎 | `ALH Frame Lite` 走 ffmpeg `minterpolate`；`ALH Frame Standard` 走自研块匹配内核；`ALH Frame Standard v2` 是同一内核的稠密光流档（见下节）|
 | 去重复帧 | 仅 Pro 可用。相邻帧 luma 采样差 < 0.8 判为重复，直接复制当前帧，省掉一次运动估计 |
 
 ## 构建

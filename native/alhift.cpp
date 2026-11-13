@@ -393,6 +393,44 @@ static void flow_level(const Img &a, const Img &b, std::vector<float> &u, std::v
 }
 
 // 从 half 分辨率金字塔求场，再双线性放大到全分辨率；返回的场语义：b(x+u) ≈ a(x)
+// 候选竞争：每个像素不只信一个矢量，把「光流、块匹配、反向场推出的矢量、四邻微调」
+// 都代进对称残差里比一遍，谁让两帧对得上就用谁。遮挡边缘靠这条不需要额外的分割。
+static void compete(const Img &a, const Img &b, int W, int H, std::vector<Vec2> &f,
+                    const std::vector<Vec2> &bf, int bw, int bh, int B,
+                    const std::vector<Vec2> &rev, int rw, int rh) {
+    std::vector<Vec2> out(f.size());
+    const float T = 0.5f;
+    for (int y = 0; y < H; y++) {
+        for (int x = 0; x < W; x++) {
+            size_t i = (size_t)y * W + x;
+            Vec2 c[10];
+            int n = 0;
+            c[n++] = f[i];
+            if (bw > 0 && bh > 0) c[n++] = sample_vec_b(bf, bw, bh, B, x, y);
+            if (rw > 0 && rh > 0) {
+                Vec2 rv = sample_vec_b(rev, rw, rh, B, x, y);
+                c[n++] = Vec2{-0.5f * rv.x * 2.0f * 0.5f - rv.x * 0.0f, -0.5f * rv.y};
+            }
+            c[n++] = Vec2{f[i].x + 0.5f, f[i].y};
+            c[n++] = Vec2{f[i].x, f[i].y + 0.5f};
+            c[n++] = Vec2{f[i].x - 0.5f, f[i].y};
+            c[n++] = Vec2{f[i].x + 0.5f, f[i].y + 0.5f};
+            c[n++] = Vec2{f[i].x - 0.5f, f[i].y - 0.5f};
+            float best = 1e9f; Vec2 bv = f[i];
+            for (int k = 0; k < n; k++) {
+                float p0 = bilin(a, x - c[k].x * T, y - c[k].y * T);
+                float p1 = bilin(b, x + c[k].x * (1.0f - T), y + c[k].y * (1.0f - T));
+                if (p0 < 0 || p1 < 0) continue;
+                static const float PEN = getenv("ALH_CPEN") ? (float)atof(getenv("ALH_CPEN")) : 0.04f;
+                float cost = std::fabs(p0 - p1) + PEN * (std::fabs(c[k].x) + std::fabs(c[k].y));
+                if (cost < best) { best = cost; bv = c[k]; }
+            }
+            out[i] = bv;
+        }
+    }
+    f.swap(out);
+}
+
 // 逐块仲裁：光流把场拉连续，但遮挡边缘处块匹配的整块矢量反而更准。
 // 每 8×8 块比一次「对称残差」，块匹配更好就把这整块的矢量写回去。
 static float mid_res(const Img &a, const Img &b, int x, int y, Vec2 vv) {
@@ -657,6 +695,9 @@ int main(int argc, char **argv) {
             {
                 vector<Vec2> dense;
                 flow_dense(pa, pb, W, H, dense, (opt & 16777216) ? &cur : nullptr, nbw, nbh, 8);
+                if (opt & 536870912) {
+                    compete(pa[0], pb[0], W, H, dense, cur, nbw, nbh, 8, gfield, gw, gh);
+                }
                 if (opt & 4194304) {
                     // 每块比一次残差，块匹配更准的整块写回（遮挡边缘靠这条保锐度）
                     arbitrate(pa[0], pb[0], W, H, dense, cur, nbw, nbh, 8);

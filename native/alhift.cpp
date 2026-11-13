@@ -393,6 +393,46 @@ static void flow_level(const Img &a, const Img &b, std::vector<float> &u, std::v
 }
 
 // 从 half 分辨率金字塔求场，再双线性放大到全分辨率；返回的场语义：b(x+u) ≈ a(x)
+// 逐块仲裁：光流把场拉连续，但遮挡边缘处块匹配的整块矢量反而更准。
+// 每 8×8 块比一次「对称残差」，块匹配更好就把这整块的矢量写回去。
+static float mid_res(const Img &a, const Img &b, int x, int y, Vec2 vv) {
+    float p0 = bilin(a, x - vv.x * 0.5f, y - vv.y * 0.5f);
+    float p1 = bilin(b, x + vv.x * 0.5f, y + vv.y * 0.5f);
+    if (p0 < 0 || p1 < 0) return 255.0f;
+    return std::fabs(p0 - p1);
+}
+
+static void arbitrate(const Img &a, const Img &b, int W, int H,
+                      std::vector<Vec2> &dense, const std::vector<Vec2> &bf,
+                      int bw, int bh, int B) {
+    if (bw <= 0 || bh <= 0) return;
+    for (int by = 0; by < bh; by++) {
+        for (int bx = 0; bx < bw; bx++) {
+            Vec2 bv = bf[(size_t)by * bw + bx];
+            int cx = bx * B + B / 2, cy = by * B + B / 2;
+            if (cx >= W || cy >= H) continue;
+            Vec2 dv = dense[(size_t)cy * W + cx];
+            float rd = 0, rb = 0; int n = 0;
+            for (int k = 0; k < 5; k++) {
+                int x = bv.x == bv.x ? std::min(W - 1, std::max(0, cx + (k == 1 ? -2 : (k == 2 ? 2 : 0))))
+                                     : cx;
+                int y = std::min(H - 1, std::max(0, cy + (k == 3 ? -2 : (k == 4 ? 2 : 0))));
+                rd += mid_res(a, b, x, y, dv);
+                rb += mid_res(a, b, x, y, bv);
+                n++;
+            }
+            if (n == 0) continue;
+            rd /= n; rb /= n;
+            static const float ARB_T = getenv("ALH_ARBT") ? (float)atof(getenv("ALH_ARBT")) : 0.98f;
+            if (rb < rd * ARB_T) {
+                for (int y = by * B; y < std::min(H, by * B + B); y++)
+                    for (int x = bx * B; x < std::min(W, bx * B + B); x++)
+                        dense[(size_t)y * W + x] = bv;
+            }
+        }
+    }
+}
+
 static void flow_dense(const std::vector<Img> &pa, const std::vector<Img> &pb, int W, int H,
                        std::vector<Vec2> &out, const std::vector<Vec2> *seed = nullptr,
                        int sbw = 0, int sbh = 0, int sB = 8) {
@@ -617,6 +657,10 @@ int main(int argc, char **argv) {
             {
                 vector<Vec2> dense;
                 flow_dense(pa, pb, W, H, dense, (opt & 16777216) ? &cur : nullptr, nbw, nbh, 8);
+                if (opt & 4194304) {
+                    // 每块比一次残差，块匹配更准的整块写回（遮挡边缘靠这条保锐度）
+                    arbitrate(pa[0], pb[0], W, H, dense, cur, nbw, nbh, 8);
+                }
                 cur.swap(dense);
             }
             nbw = W; nbh = H;

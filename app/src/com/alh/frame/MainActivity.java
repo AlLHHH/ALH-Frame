@@ -465,7 +465,7 @@ public class MainActivity extends Activity {
 
     // ------------------------------------------------------------------ 流程
 
-    static final String[] ENGINE_NAMES = {"ALH Frame Lite", "ALH Frame Standard"};
+    static final String[] ENGINE_NAMES = {"ALH Frame Lite", "ALH Frame Standard", "ALH Frame Standard v2"};
 
     // 自绘下拉：黑卡片 + 两行选项，避系统弹出的白边框
     private void showEngineMenu(View anchor) {
@@ -506,18 +506,20 @@ public class MainActivity extends Activity {
             tvEngine.setText(ENGINE_NAMES[e]);
         }
         if (tvEngineNote != null) {
-            tvEngineNote.setText(e == 1
-                    ? "自研内核（实验）：低分辨率更快，复杂实拍可能有块状伪影。"
-                    : "基于 ffmpeg minterpolate：复杂运动更稳，推荐日常使用。");
+            tvEngineNote.setText(e == 0
+                    ? "基于 ffmpeg minterpolate：复杂运动更稳，推荐日常使用。"
+                    : e == 1
+                    ? "自研内核：块匹配，速度快，细节更锐。"
+                    : "自研内核 v2：块匹配种子 + 稠密光流细化，边缘更连续，细节略软，速度最慢。");
         }
         if (btnDedup != null) {
             // 去重复帧是自研内核的开关，Lite 上不显示，免得看成对 ffmpeg 也能用
-            btnDedup.setVisibility(e == 1 ? View.VISIBLE : View.GONE);
-            btnDedup.setEnabled(e == 1);
-            btnDedup.setTextColor(e == 1 ? (dedup ? -1 : C_TEXT) : C_DIM);
-            btnDedup.setBackground(round(e == 1 && dedup ? C_ACC : C_OFF, dp(12)));
+            btnDedup.setVisibility(e != 0 ? View.VISIBLE : View.GONE);
+            btnDedup.setEnabled(e != 0);
+            btnDedup.setTextColor(e != 0 ? (dedup ? -1 : C_TEXT) : C_DIM);
+            btnDedup.setBackground(round(e != 0 && dedup ? C_ACC : C_OFF, dp(12)));
             btnDedup.setText(dedup ? "去重复帧 开" : "去重复帧 关");
-            if (e != 1) {
+            if (e == 0) {
                 dedup = false;
                 btnDedup.setText("去重复帧 关");
             }

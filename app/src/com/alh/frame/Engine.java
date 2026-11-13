@@ -335,6 +335,18 @@ public class Engine {
         cb.progress("正在准备 · 读取源文件", -1, 0, -1);
         Info ii = probe(src);
 
+        // 低分辨率是 ffmpeg 的死角：360p 上 epzs 基本给零矢量，minterpolate 退化成对半淡入淡出，
+        // 看着就是「局部糊、局部跳」。这一档来自研内核反而又快又清楚，所以自动顶上。
+        if (mode == MODE_LITE && proBin == null && (long) ii.w * ii.h <= 640L * 480L) {
+            String pb = Pro.bin(ctx);
+            if (pb != null) {
+                proBin = pb;
+                mode = MODE_PRO;
+                note("pro", "源分辨率 " + ii.w + "×" + ii.h + " 偏低，ffmpeg 在这档基本只做淡入淡出，"
+                        + "本次自动改用自研内核");
+            }
+        }
+
         double inFps = ii.fps;
         double dur = ii.durSec;
         double outFps = inFps * mult;

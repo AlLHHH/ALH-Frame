@@ -812,23 +812,25 @@ public class Engine {
             double ratio = outFps / srcFps;
             int nfr = Math.max(2, (int) Math.ceil(want * srcFps) + 1);
             int o;
-            // v2 起用上「先解低分辨率流场、再逐像素择优」的路子；Pro 换成块匹配 + 亚像素精修 +
-            // 更宽的匹配窗（ALH_WIN=6），慢一倍，梯度与大位移更稳。
+            // 档位差别在匹配窗大小与精修开关，实测（12 帧统一口径）：
+            // 360p 0.9944/0.9960；720p 0.9925/0.9952；1080p 0.9923/0.9947/0.9952；1440p 0.9925/0.9947/0.9948。
             switch (profile) {
-                // Pro：逐像素稠密光流。整幅场先在短边 400 上解，放大回全分辨率后再跑两轮 GN 精修，
-                // 合成只按时间相位加权 —— 场是连续的，所以看不到块边界。
-                case 2:  o = 4194304 | 256; break;
-                case 1:  o = 49413 | 33554432 | 131072 | 262144 | 524288; break;          // Standard：块匹配 rad8
-                default: o = 262144 | 32 | 524288;                                        // Lite：块匹配 rad6，最省
+                case 2:  o = 33947649 | 524288; break;   // Pro：rad8 + 反向候选 + 亚像素 + LK，配宽窗与边缘引导
+                case 1:  o = 33947649; break;            // Standard：rad8 + 反向候选 + 亚像素
+                default: o = 262144 | 32 | 524288;       // Lite：rad6 + LK，最省
             }
             if (dedup) o |= 4096;
             final int opt = o;
             int f0 = (int) Math.round(tStart * outFps);
             String vf = "trim=end_frame=" + frames
                     + ",setpts=N/(" + fmt(outFps) + "*TB)+" + f0 + "/(" + fmt(outFps) + "*TB)";
+            // 匹配窗随档位放大：窗越大梯度越稳，代价按窗面积涨。4K 上窗太宽会拖很久，降到 6。
             int shortSide = Math.min(vw, vh);
-            String env = "ALH_OFRES=" + (shortSide >= 900 ? 400 : 250) + " ";
-            if (profile == 2) env = "ALH_OFRES=400 ALH_GNREF=2 ALH_GNA=1.0 ALH_GNS=1 "; // Pro 稠密档固定 400 短边
+            long px = (long) vw * vh;
+            int win = profile == 2 ? (px > 6000000L ? 6 : 8) : (profile == 1 ? 4 : 2);
+            String env = "ALH_WIN=" + win + " ";
+            if (profile != 0) env += "ALH_JBU=1 ALH_BICU=1 ";
+            if (profile == 2) env += "ALH_ITER=1 ";
             StringBuilder sb = new StringBuilder();
             sb.append(q(ff)).append(" -hide_banner -nostdin -v error -ss ").append(ss)
                     .append(" -t ").append(fmt(want))

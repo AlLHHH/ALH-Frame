@@ -47,7 +47,9 @@ static int g_vmed = 1;        // 稠密场矢量中值（去条纹，保留边�
 static float g_da = 0.35f;    // DIS 最细层变分平滑系数（越小越锐、越大越滑）
 static int g_dit = 3;         // DIS 最细层变分迭代次数
 static int g_dp = 0;
-static float g_dms = 2.0f;   // DIS patch 每轮位移上限（大位移要靠这个放开）          // DIS 最细层额外 patch 遍数（每遍 P=8、step=2、maxstep 0.5）
+static float g_dms = 2.0f;    // DIS patch 每轮位移上限（大位移靠这个放开）
+static int g_dpe = 0;         // DIS 最细层额外 patch 遍数（P=8/step=2/maxstep=0.5）
+static float g_dupThr = -1.f; // 去重阈值：按噪声自动定，<0 表示还没算
 
 // 噪声估计：拉普拉斯响应的 MAD/6 ≈ 高斯噪声 σ（灰阶）
 static float y_sigma(const Img &a) {
@@ -1009,6 +1011,7 @@ int main(int argc, char **argv) {
     if (const char *e = getenv("ALH_DIT")) g_dit = atoi(e);
     if (const char *e = getenv("ALH_DP")) g_dp = atoi(e);
     if (const char *e = getenv("ALH_DMS")) g_dms = (float)atof(e);
+    if (const char *e = getenv("ALH_DUP")) g_dupThr = (float)atof(e);
     if (const char *e = getenv("ALH_OFRES")) g_ofres = atoi(e);
     if (const char *e = getenv("ALH_HSOUT")) g_hsout = atoi(e);
     if (const char *e = getenv("ALH_HSIN")) g_hsin = atoi(e);
@@ -1060,7 +1063,16 @@ int main(int argc, char **argv) {
             if (g_pen < 0.02f) g_pen = 0.02f;
             if (g_pen > 0.25f) g_pen = 0.25f;
             penFixed = true;
-            fprintf(stderr, "sigma=%.2f pen=%.3f\n", sg, g_pen);
+            // 去重阈值跟着噪声走：干净片 0.8 够用；颗粒重的片子必须放宽，
+            // 否则静止镜头的帧间差被噪声顶起来，永远判不出重复。
+            // 实测：纯噪声静止画面的帧间 MAD ≈ 1.5σ，真实运动画面 ≥ 3σ，
+            // 所以阈值取 1.6σ 能把"颗粒噪点"判成静止，同时不误吃真实运动。
+            if (g_dupThr < 0.f) {
+                g_dupThr = 1.6f * sg;
+                if (g_dupThr < 0.8f) g_dupThr = 0.8f;
+                if (g_dupThr > 8.0f) g_dupThr = 8.0f;
+            }
+            fprintf(stderr, "sigma=%.2f pen=%.3f dup=%.2f\n", sg, g_pen, g_dupThr);
         }
 
         // 这一段要输出的帧数：按累积相位取整，支持非整数倍（24fps→60fps 的 2.5 倍）
@@ -1074,11 +1086,11 @@ int main(int argc, char **argv) {
             long dsum = 0;
             for (size_t i = 0; i < ysz; i += 4) dsum += std::abs((int)pa_[i] - (int)pb_[i]);
             float mad = (float)dsum / (float)(ysz / 4);
-            if (mad < 0.8f) {
+            if (mad < g_dupThr) {
                 for (int s = 0; s < nseg; s++) fwrite(fa.data(), 1, fsz, fo);
                 done += nseg;
                 ndup++;
-                fprintf(stderr, "k=%d dup mad=%.2f\n", k, mad);
+                fprintf(stderr, "k=%d dup mad=%.2f thr=%.2f\n", k, mad, g_dupThr);
                 continue;
             }
         }

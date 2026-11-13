@@ -121,6 +121,7 @@ public class Engine {
     /** 引擎：0 = ALH Frame Lite（ffmpeg minterpolate），1 = ALH Frame Standard（自研内核）。 */
     static final int MODE_LITE = 0;
     static final int MODE_PRO = 1;
+    static final int MODE_FLOW = 2;   // 普通版 v2：块匹配种子 + 稠密光流细化
 
     int mode = MODE_LITE;
     /** 去重复帧：前后帧几乎一致时直接复制，不插值（Pro 内核支持）。 */
@@ -289,8 +290,8 @@ public class Engine {
                       final int engineMode, final boolean dedupOn) {
         this.mode = engineMode;
         this.dedup = dedupOn;
-        this.proBin = engineMode == MODE_PRO ? Pro.bin(ctx) : null;
-        if (engineMode == MODE_PRO && proBin == null) {
+        this.proBin = engineMode == MODE_LITE ? null : Pro.bin(ctx);
+        if (engineMode != MODE_LITE && proBin == null) {
             note("pro", "当前架构没有自研内核，回落 Lite");
             this.mode = MODE_LITE;
         }
@@ -656,11 +657,11 @@ public class Engine {
                 }
             }
             String dur = fmt(want);
-            if (mode == MODE_PRO && proBin != null && attempt == 0) {
+            if (mode != MODE_LITE && proBin != null && attempt == 0) {
                 runPro(ss, want);
                 return;
             }
-            if (mode == MODE_PRO && proBin != null) {
+            if (mode != MODE_LITE && proBin != null) {
                 // 自研内核这一档没跑通，重跑时换成 ffmpeg 路径：宁可慢一点也要出片
                 note("pro", out.getName() + " 改走 Lite 路径重跑");
             }
@@ -820,7 +821,10 @@ public class Engine {
             // 帧数严格等于 round(输入帧数×倍率)，再由 trim=end_frame 裁到本段应出的帧数。
             double ratio = outFps / srcFps;
             int nfr = Math.max(2, (int) Math.ceil(want * srcFps) + 1);
-            final int opt = 49413 | 33554432 | 131072 | 262144 | (dedup ? 4096 : 0);
+            int o = 49413 | 33554432 | 131072 | 262144;
+            if (mode == MODE_FLOW) o |= 8388608;            // 逐像素光流档
+            if (dedup) o |= 4096;
+            final int opt = o;
             int f0 = (int) Math.round(tStart * outFps);
             String vf = "trim=end_frame=" + frames
                     + ",setpts=N/(" + fmt(outFps) + "*TB)+" + f0 + "/(" + fmt(outFps) + "*TB)";

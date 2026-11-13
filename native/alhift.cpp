@@ -56,6 +56,7 @@ static int g_resid = 1;       // 层间改造：warp 掉已有位移，只解残
 static int g_pass = 3;        // 每层 patch 迭代遍数（调参用）
 static int g_seed = 8;        // 最粗层全局平移种子搜索半径（0=关）
 static int g_cos = 0;         // 混合权重用余弦缓动（1=开）
+static int g_occ = 1;         // 遮挡区只取单侧（0=退回两侧混合）
 
 // 噪声估计：拉普拉斯响应的 MAD/6 ≈ 高斯噪声 σ（灰阶）
 static float y_sigma(const Img &a) {
@@ -1146,6 +1147,7 @@ int main(int argc, char **argv) {
     if (const char *e = getenv("ALH_PASS")) g_pass = atoi(e);
     if (const char *e = getenv("ALH_SEED")) g_seed = atoi(e);
     if (const char *e = getenv("ALH_COS")) g_cos = atoi(e);
+    if (const char *e = getenv("ALH_OCC")) g_occ = atoi(e);
     if (const char *e = getenv("ALH_OFRES")) g_ofres = atoi(e);
     if (const char *e = getenv("ALH_HSOUT")) g_hsout = atoi(e);
     if (const char *e = getenv("ALH_HSIN")) g_hsin = atoi(e);
@@ -1388,7 +1390,7 @@ int main(int argc, char **argv) {
         fprintf(stderr, "k=%d conf done\n", k);
         // 稠密光流档：用前后向一致性标出遮挡像素，合成时那里只取一侧，避免双影
         std::vector<uint8_t> occ;
-        if (opt & 1073741824) fb_occlusion(cur, gfield, W, H, 1.5f, occ);
+        if ((opt & 1073741824) && g_occ) fb_occlusion(cur, gfield, W, H, 1.5f, occ);
         const int hw = W / 2, hh = H / 2;
         const float SIG2 = 2.0f * 40.0f * 40.0f;
         // 输出本区间所有帧：t 按真实相位算，非整数倍也成立，帧数严格等于 round(N×倍率)。
@@ -1501,7 +1503,8 @@ int main(int argc, char **argv) {
                         }
                     }
                     // 遮挡区只取一侧：被遮住的那一侧本来就看不到，混进来就是双影
-                    if (!occ.empty() && occ[(size_t)y * W + x]) val = (t < 0.5f) ? P0 : P1;
+                    if (!occ.empty() && occ[(size_t)y * W + x])
+                        val = (g_occ == 2) ? tm : ((t < 0.5f) ? P0 : P1);
                     oy[(size_t)y * W + x] = (uint8_t)std::max(0, std::min(255, (int)lroundf(val)));
                 }
             }

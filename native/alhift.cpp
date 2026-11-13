@@ -223,19 +223,25 @@ static void refine_sub(const Img &a, const Img &b, vector<Vec2> &v, int B, int b
             for (int bx = 0; bx < bw; bx++) {
                 int px = bx * B, py = by * B;
                 Vec2 t = v[(size_t)by * bw + bx];
-                float c0 = sad_at(a, b, px, py, B, t.x, t.y);
-                float cx1 = sad_at(a, b, px, py, B, t.x + 0.5f, t.y);
-                float cx0 = sad_at(a, b, px, py, B, t.x - 0.5f, t.y);
-                float cy1 = sad_at(a, b, px, py, B, t.x, t.y + 0.5f);
-                float cy0 = sad_at(a, b, px, py, B, t.x, t.y - 0.5f);
                 auto parab = [&](float m1, float c, float p1) -> float {
                     float den = m1 - 2 * c + p1;
                     if (fabsf(den) < 1e-3f) return 0;
                     float d = 0.5f * (m1 - p1) / den;
                     return std::max(-0.5f, std::min(0.5f, d));
                 };
-                t.x += parab(cx0, c0, cx1) * 0.5f;
-                t.y += parab(cy0, c0, cy1) * 0.5f;
+                // 两轮抛物线：先按 ±1 像素粗定位（可修正 ±0.5），再按 ±0.5 收细（±0.25）。
+                // 只做一轮 ±0.5 的话最多只能纠 0.25 像素，整数量化留下的半像素误差还在，
+                // 慢速平移就会一半帧不动、一半帧跳两倍距离——画面一顿一顿的根源。
+                for (int round = 0; round < 2; round++) {
+                    float step = round == 0 ? 1.0f : 0.5f;
+                    float c0 = sad_at(a, b, px, py, B, t.x, t.y);
+                    float cx1 = sad_at(a, b, px, py, B, t.x + step, t.y);
+                    float cx0 = sad_at(a, b, px, py, B, t.x - step, t.y);
+                    float cy1 = sad_at(a, b, px, py, B, t.x, t.y + step);
+                    float cy0 = sad_at(a, b, px, py, B, t.x, t.y - step);
+                    t.x += parab(cx0, c0, cx1) * step;
+                    t.y += parab(cy0, c0, cy1) * step;
+                }
                 v[(size_t)by * bw + bx] = t;
             }
         }
@@ -283,6 +289,53 @@ static void refine_lk(const Img &a, const Img &b, vector<Vec2> &v, int B, int bw
     for (auto &t : th) t.join();
 }
 
+// 稠密 LK 精修：窗口跨 3×3 个块，窗口内每点的矢量都从双线性场采样（不是单一块矢量），
+// 因此解出来的场随位置连续变化；单块 LK 只能把整块平移，接缝处的瞬时差就是「果冻」。
+static void refine_dense(const Img &a, const Img &b, vector<Vec2> &v, int B, int bw, int bh, int iters) {
+    const int half = (int)(B * 1.5f);
+    const int SS = 4;
+    const int nthreads = std::max(1u, std::thread::hardware_concurrency());
+    vector<Vec2> cur = v, nxt = v;
+    for (int it = 0; it < iters; it++) {
+        auto work = [&](int y0, int y1) {
+            for (int by = y0; by < y1; by++) {
+                for (int bx = 0; bx < bw; bx++) {
+                    float cx = bx * B + B * 0.5f, cy = by * B + B * 0.5f;
+                    Vec2 t = sample_vec_b(cur, bw, bh, B, (int)cx, (int)cy);
+                    double nx = 0, ny = 0, den = 0;
+                    for (int oy = -half; oy <= half; oy += SS) {
+                        for (int ox = -half; ox <= half; ox += SS) {
+                            float px = cx + ox, py = cy + oy;
+                            if (px < 1 || py < 1 || px > a.w - 2 || py > a.h - 2) continue;
+                            Vec2 tv = sample_vec_b(cur, bw, bh, B, (int)px, (int)py);
+                            float wx = px + tv.x, wy = py + tv.y;
+                            if (wx < 1 || wy < 1 || wx > a.w - 2 || wy > a.h - 2) continue;
+                            float bb = bilin(b, wx, wy);
+                            float gx = (bilin(b, wx + 1, wy) - bilin(b, wx - 1, wy)) * 0.5f;
+                            float gy = (bilin(b, wx, wy + 1) - bilin(b, wx, wy - 1)) * 0.5f;
+                            double r = (double)bilin(a, px, py) - bb;
+                            nx += gx * r; ny += gy * r;
+                            den += (double)gx * gx + (double)gy * gy;
+                        }
+                    }
+                    if (den > 1e-3) {
+                        float dx = std::max(-0.5f, std::min(0.5f, (float)(nx / den)));
+                        float dy = std::max(-0.5f, std::min(0.5f, (float)(ny / den)));
+                        t.x += dx; t.y += dy;
+                    }
+                    nxt[(size_t)by * bw + bx] = t;
+                }
+            }
+        };
+        vector<std::thread> th;
+        int step = std::max(1, bh / nthreads);
+        for (int y = 0; y < bh; y += step) th.emplace_back(work, y, std::min(bh, y + step));
+        for (auto &t : th) t.join();
+        cur.swap(nxt);
+    }
+    v.swap(cur);
+}
+
 int main(int argc, char **argv) {
     if (argc < 6) {
         fprintf(stderr, "usage: alhift in.yuv W H N out.yuv [mult]\n");
@@ -292,9 +345,9 @@ int main(int argc, char **argv) {
     W = atoi(argv[2]); H = atoi(argv[3]);
     int NFR = atoi(argv[4]);
     const char *outp = argv[5];
-    int mult = (argc > 6) ? atoi(argv[6]) : 2;
+    float mult = (argc > 6) ? (float)atof(argv[6]) : 2.0f;
     int opt = (argc > 7) ? atoi(argv[7]) : 3;
-    if (W <= 0 || H <= 0 || NFR <= 0 || mult < 2) return 2;
+    if (W <= 0 || H <= 0 || NFR <= 0 || mult < 1.01f) return 2;
     bool penFixed = false;
     if (const char *e = getenv("ALH_PEN")) { g_pen = (float)atof(e); penFixed = true; }
     if (const char *e = getenv("ALH_WIN")) g_win = atoi(e);
@@ -346,6 +399,11 @@ int main(int argc, char **argv) {
             fprintf(stderr, "sigma=%.2f pen=%.3f\n", sg, g_pen);
         }
 
+        // 这一段要输出的帧数：按累积相位取整，支持非整数倍（24fps→60fps 的 2.5 倍）
+        const int seg0 = (int)llround((double)k * mult);
+        const int seg1 = (int)llround((double)(k + 1) * mult);
+        const int nseg = seg1 - seg0;
+
         // 去重复帧：前后两帧几乎一致时直接复制，不插值（避免鬼影与假运动）
         if (opt & 4096) {
             const uint8_t *pa_ = fa.data(), *pb_ = fb.data();
@@ -353,8 +411,8 @@ int main(int argc, char **argv) {
             for (size_t i = 0; i < ysz; i += 4) dsum += std::abs((int)pa_[i] - (int)pb_[i]);
             float mad = (float)dsum / (float)(ysz / 4);
             if (mad < 0.8f) {
-                for (int s = 0; s < mult; s++) fwrite(fa.data(), 1, fsz, fo);
-                done += mult;
+                for (int s = 0; s < nseg; s++) fwrite(fa.data(), 1, fsz, fo);
+                done += nseg;
                 ndup++;
                 fprintf(stderr, "k=%d dup mad=%.2f\n", k, mad);
                 continue;
@@ -369,8 +427,8 @@ int main(int argc, char **argv) {
                 for (int x = 0; x < W; x += 4) { dsum += std::abs((int)ra[x] - (int)rb[x]); cnt++; }
             }
             if (cnt > 0 && (float)dsum / cnt > 26.0f) {
-                for (int q = 0; q < mult; q++) fwrite(fa.data(), 1, fsz, fo);
-                done += mult;
+                for (int q = 0; q < nseg; q++) fwrite(fa.data(), 1, fsz, fo);
+                done += nseg;
                 fprintf(stderr, "k=%d scd\n", k);
                 fa.swap(fb);
                 continue;
@@ -421,6 +479,7 @@ int main(int argc, char **argv) {
         if (opt & 16) { median3(cur, bw, bh); median3(cur, bw, bh); }   // 多遍中值：压块状拼布
         if (opt & 1) refine_sub(pa[0], pb[0], cur, B, bw, bh);
         if (opt & 524288) refine_lk(pa[0], pb[0], cur, B, bw, bh, 3);
+        if (opt & 1048576) refine_dense(pa[0], pb[0], cur, B, bw, bh, 3);
         if (opt & 1) median3(cur, bw, bh);
         // 时间一致性：与上一对帧的矢量场轻微融合，压掉逐帧跳变
         static vector<Vec2> prevV;
@@ -452,13 +511,12 @@ int main(int argc, char **argv) {
         }
 
         fprintf(stderr, "k=%d conf done\n", k);
-        // 输出：原始帧 + 插值帧（mult-1 张）
-        fwrite(fa.data(), 1, fsz, fo);
-        done++;
         const int hw = W / 2, hh = H / 2;
         const float SIG2 = 2.0f * 40.0f * 40.0f;
-        for (int s = 1; s < mult; s++) {
-            float t = (float)s / (float)mult;
+        // 输出本区间所有帧：t 按真实相位算，非整数倍也成立，帧数严格等于 round(N×倍率)。
+        for (int gi = seg0; gi < seg1; gi++) {
+            float t = (float)(((double)gi - (double)k * mult) / mult);
+            if (t < 1e-4f) { fwrite(fa.data(), 1, fsz, fo); done++; continue; }
             vector<uint8_t> out(fsz);
             uint8_t *oy = out.data(), *ou = out.data() + ysz, *ov = ou + csz;
             for (int y = 0; y < H; y++) {
@@ -611,11 +669,6 @@ int main(int argc, char **argv) {
             done++;
         }
         fa.swap(fb);
-    }
-    // 收尾：最后一帧没有后继帧可插，直接照抄，否则每段少一帧、段尾会顿一下
-    if (done > 0) {
-        fwrite(fa.data(), 1, fsz, fo);
-        done++;
     }
     fclose(fi); fclose(fo);
     if (done == 0) { fprintf(stderr, "no frames written\n"); return 4; }

@@ -478,7 +478,7 @@ public class MainActivity extends Activity {
 
     // 三档，一列一个：Lite 最快 / Standard 均衡 / Pro 最慢但画质最好
     static final String[] ENGINE_TYPES = {"Lite", "Standard", "Pro"};
-    static final String[] ENGINE_HINT = {"最快", "均衡", "最佳画质"};
+    static final String[] ENGINE_HINT = {"速度优先", "均衡", "质量优先"};
 
     static String labelOf(int code) {
         return "ALH Frame " + ENGINE_TYPES[code];
@@ -537,11 +537,11 @@ public class MainActivity extends Activity {
         if (tvEngineNote != null) {
             String note;
             if (e == 0) {
-                note = "最快：小搜索半径，逐帧速度快，适合长片先出结果。";
+                note = "速度优先：最细层搜索半径 6，单帧处理耗时最低，适合长视频快速出片。";
             } else if (e == 1) {
-                note = "均衡：搜索半径加大并启用亚像素精修，画质比 Lite 高一点，耗时略增。";
+                note = "均衡：搜索半径 8，启用反向场候选与亚像素精修，画质高于 Lite，耗时小幅增加。";
             } else {
-                note = "最佳画质：最细层搜索半径 16 + 宽匹配窗 + 可见性加权，速度最慢，复杂运动最稳。";
+                note = "质量优先：搜索半径 16、匹配窗外扩 6 像素并启用可见性加权，复杂运动与纹理稀疏区域更稳定，耗时约为均衡档的五倍。";
             }
             tvEngineNote.setText(note);
         }

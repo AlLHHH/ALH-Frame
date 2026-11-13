@@ -119,11 +119,14 @@ public class Engine {
     final StringBuilder trace = new StringBuilder();
 
     /** 引擎：0 = ALH Frame Lite（ffmpeg minterpolate），1 = ALH Frame Standard（自研块匹配），2 = ALH Frame Pro（低分辨率稠密流场）。 */
-    static final int MODE_LITE = 0;
-    static final int MODE_STD = 1;
-    static final int MODE_PRO = 2;
+    // 档位（profile）：0 只用 ffmpeg；1/2 块匹配内核；3/4 光流内核
+    static final int PROFILE_LITE = 0;
+    static final int PROFILE_STD1 = 1;
+    static final int PROFILE_STD2 = 2;
+    static final int PROFILE_PRO1 = 3;
+    static final int PROFILE_PRO2 = 4;
 
-    int mode = MODE_LITE;
+    int profile = PROFILE_LITE;
     /** 去重复帧：前后帧几乎一致时直接复制，不插值（Pro 内核支持）。 */
     boolean dedup;
     /** Pro 内核可执行文件路径；为空表示当前架构没有内核，自动回落 Lite。 */
@@ -283,17 +286,17 @@ public class Engine {
     // ------------------------------------------------------------------ 主流程
 
     public void start(final File src, final int mult, final File outDir) {
-        start(src, mult, outDir, MODE_LITE, false);
+        start(src, mult, outDir, PROFILE_LITE, false);
     }
 
     public void start(final File src, final int mult, final File outDir,
                       final int engineMode, final boolean dedupOn) {
-        this.mode = engineMode;
+        this.profile = engineMode;
         this.dedup = dedupOn;
-        this.proBin = engineMode == MODE_LITE ? null : Pro.bin(ctx);
-        if (engineMode != MODE_LITE && proBin == null) {
+        this.proBin = engineMode == PROFILE_LITE ? null : Pro.bin(ctx);
+        if (engineMode != PROFILE_LITE && proBin == null) {
             note("pro", "当前架构没有自研内核，回落 Lite");
-            this.mode = MODE_LITE;
+            this.profile = PROFILE_LITE;
         }
         new Thread(new Runnable() {
             public void run() {
@@ -338,11 +341,11 @@ public class Engine {
 
         // 低分辨率是 ffmpeg 的死角：360p 上 epzs 基本给零矢量，minterpolate 退化成对半淡入淡出，
         // 看着就是「局部糊、局部跳」。这一档来自研内核反而又快又清楚，所以自动顶上。
-        if (mode == MODE_LITE && proBin == null && (long) ii.w * ii.h <= 640L * 480L) {
+        if (profile == PROFILE_LITE && proBin == null && (long) ii.w * ii.h <= 640L * 480L) {
             String pb = Pro.bin(ctx);
             if (pb != null) {
                 proBin = pb;
-                mode = MODE_PRO;
+                profile = PROFILE_PRO1;
                 note("pro", "源分辨率 " + ii.w + "×" + ii.h + " 偏低，ffmpeg 在这档基本只做淡入淡出，"
                         + "本次自动改用自研内核");
             }
@@ -657,11 +660,11 @@ public class Engine {
                 }
             }
             String dur = fmt(want);
-            if (mode != MODE_LITE && proBin != null && attempt == 0) {
+            if (profile != PROFILE_LITE && proBin != null && attempt == 0) {
                 runPro(ss, want);
                 return;
             }
-            if (mode != MODE_LITE && proBin != null) {
+            if (profile != PROFILE_LITE && proBin != null) {
                 // 自研内核这一档没跑通，重跑时换成 ffmpeg 路径：宁可慢一点也要出片
                 note("pro", out.getName() + " 改走 Lite 路径重跑");
             }
@@ -821,10 +824,13 @@ public class Engine {
             // 帧数严格等于 round(输入帧数×倍率)，再由 trim=end_frame 裁到本段应出的帧数。
             double ratio = outFps / srcFps;
             int nfr = Math.max(2, (int) Math.ceil(want * srcFps) + 1);
-            int o = 49413 | 33554432 | 131072 | 262144;
-            // Pro：流场在低分辨率上解，再逐像素与块场择优。场是连续逐像素的，没有方格，
-            // 解算尺度远小于画面，所以耗时约为标准档的一半。
-            if (mode == MODE_PRO) o = 4194304 | 268435456 | 262144;
+            int o;
+            switch (profile) {
+                case 2:  o = 49413 | 33554432 | 131072 | 262144 | 524288; break;   // 标准 v2：块匹配 + 亚像素精修
+                case 3:  o = 4194304 | 268435456 | 262144; break;                   // Pro v1：低分辨率解流场再逐像素择优
+                case 4:  o = 1073741824 | 262144; break;                            // Pro v2：DIS 式稠密光流
+                default: o = 49413 | 33554432 | 131072 | 262144;                    // 标准 v1：块匹配
+            }
             if (dedup) o |= 4096;
             final int opt = o;
             int f0 = (int) Math.round(tStart * outFps);

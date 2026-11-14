@@ -814,7 +814,7 @@ public class Engine {
             int o;
             // 档位差别在匹配窗大小、OBMC 邻域与精修开关，窗越宽越稳、耗时越长。
             switch (profile) {
-                case 2:  o = 306610177; break;   // Pro：双向稠密光流为主，逐像素与块场择优，细节补偿收尾
+                case 2:  o = 306610177 | 16384; break;   // Pro：双向稠密光流 + 块场择优 + 残差软退避
                 case 1:  o = 33980417; break;            // Standard：rad8 + 反向候选 + 亚像素
                 default: o = 262144 | 32 | 524288;       // Lite：rad6 + LK，最省
             }
@@ -830,7 +830,7 @@ public class Engine {
             String env = "ALH_WIN=" + win + " ";
             if (profile != 0) env += "ALH_JBU=1 ALH_BICU=1 ";
             if (profile == 2) env += "ALH_OFRES=" + (px > 1000000L ? 400 : 250)
-                    + " ALH_GNREF=3 ALH_GNA=0.6 ALH_GNS=1 ALH_SHP=0.2 ALH_OB3=3 ALH_OBW=32 ";
+                    + " ALH_GNREF=3 ALH_GNA=0.6 ALH_GNS=1 ALH_SHP=0.2 ALH_OB3=3 ALH_OBW=32 ALH_FT2=0.8 ";
             if (profile == 1) env += "ALH_OB3=1 ALH_OBW=16 ";
             StringBuilder sb = new StringBuilder();
             sb.append(q(ff)).append(" -hide_banner -nostdin -v error -ss ").append(ss)

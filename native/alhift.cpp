@@ -49,6 +49,7 @@ static int g_dit = 3;         // DIS 最细层变分迭代次数
 static int g_dp = 0;
 static float g_dms = 2.0f;    // DIS patch 每轮位移上限（大位移靠这个放开）
 static int g_dpe = 0;         // DIS 最细层额外 patch 遍数（P=8/step=2/maxstep=0.5）
+static float g_shp = 0.0f;    // 光流档细节补偿强度（0 = 关）：把源帧高频按时间权重加回，抵消 warp 的插值模糊
 static int g_gnref = 0;       // after low-res solve: extra full-res GN rounds (0 = none)
 static float g_gna = 1.0f;    // alpha2 for those rounds (smaller = sharper)
 static int g_gns = 0;         // [1 2 1] smoothing passes before those rounds
@@ -1287,6 +1288,7 @@ int main(int argc, char **argv) {
     if (const char *e = getenv("ALH_GNREF")) g_gnref = atoi(e);
     if (const char *e = getenv("ALH_GNA")) g_gna = (float)atof(e);
     if (const char *e = getenv("ALH_GNS")) g_gns = atoi(e);
+    if (const char *e = getenv("ALH_SHP")) g_shp = (float)atof(e);
     if (const char *e = getenv("ALH_JBU")) g_jbu = atoi(e);
     if (const char *e = getenv("ALH_ITER")) g_iter = atoi(e);
     if (const char *e = getenv("ALH_TPRED")) g_tpred = atoi(e);
@@ -1750,6 +1752,20 @@ int main(int argc, char **argv) {
                         float a0 = (1 - t) * V0, a1 = t * V1, Z = a0 + a1;
                         if (i0 && i1 && Z > 0.02f) val = (P0 * a0 + P1 * a1) / Z;
                         else val = (t < 0.5f ? P0 : P1);
+                        // 细节补偿：warp 取点必然低通，两帧再按 t 混合又会平均掉高频，
+                        // 结果就是「顺但糊」。把两帧各自的高频（原值 − 3×3 均值）
+                        // 按同样的时间权重加回来，等于把被插值吃掉的那层细节补上。
+                        if (g_shp > 0.0f) {
+                            int xm = x > 0 ? x - 1 : 0, xp = x + 1 < W ? x + 1 : W - 1;
+                            int ym = y > 0 ? y - 1 : 0, yp = y + 1 < H ? y + 1 : H - 1;
+                            float sa = 0.f, sbv = 0.f; int nn = 0;
+                            for (int yy = ym; yy <= yp; yy++)
+                                for (int xx = xm; xx <= xp; xx++) { sa += a.row(yy)[xx]; sbv += b.row(yy)[xx]; nn++; }
+                            sa /= (float)nn; sbv /= (float)nn;
+                            float da = (float)a.row(y)[x] - sa;
+                            float db = (float)b.row(y)[x] - sbv;
+                            val += g_shp * ((1.0f - t) * da + t * db);
+                        }
                     } else if (opt & 2097152) {
                         // Super SloMo 式可见性加权：两侧各自的置信度必须分开保留，
                         // 否则归一化会把置信度整体约掉（老 bug）。V0/V1 用「warp 回原位置是否还对得上」来量。

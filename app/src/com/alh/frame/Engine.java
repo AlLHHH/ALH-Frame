@@ -814,7 +814,7 @@ public class Engine {
             int o;
             // 档位差别在匹配窗大小、OBMC 邻域与精修开关，窗越宽越稳、耗时越长。
             switch (profile) {
-                case 2:  o = 33980417; break;    // Pro：块匹配全开，配 5×5 邻域与宽 tent，慢但最稳
+                case 2:  o = 306610177; break;   // Pro：双向稠密光流为主，逐像素与块场择优，细节补偿收尾
                 case 1:  o = 33980417; break;            // Standard：rad8 + 反向候选 + 亚像素
                 default: o = 262144 | 32 | 524288;       // Lite：rad6 + LK，最省
             }
@@ -826,10 +826,11 @@ public class Engine {
             // 匹配窗随档位放大：窗越大梯度越稳，代价按窗面积涨。4K 上窗太宽会拖很久，降到 6。
             int shortSide = Math.min(vw, vh);
             long px = (long) vw * vh;
-            int win = profile == 2 ? (px > 6000000L ? 4 : 6) : (profile == 1 ? 4 : 2);
+            int win = profile == 2 ? 6 : (profile == 1 ? 4 : 2);
             String env = "ALH_WIN=" + win + " ";
             if (profile != 0) env += "ALH_JBU=1 ALH_BICU=1 ";
-            if (profile == 2) env += "ALH_OB3=3 ALH_OBW=32 ";
+            if (profile == 2) env += "ALH_OFRES=" + (px > 1000000L ? 400 : 250)
+                    + " ALH_GNREF=3 ALH_GNA=0.6 ALH_GNS=1 ALH_SHP=0.2 ALH_OB3=3 ALH_OBW=32 ";
             if (profile == 1) env += "ALH_OB3=1 ALH_OBW=16 ";
             StringBuilder sb = new StringBuilder();
             sb.append(q(ff)).append(" -hide_banner -nostdin -v error -ss ").append(ss)

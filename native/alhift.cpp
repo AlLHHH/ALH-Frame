@@ -889,53 +889,6 @@ static vector<Vec2> upsample_scaled(const vector<Vec2> &v, int bw, int bh, int n
     return o;
 }
 
-// 一次 warp + 导数 + SOR 松弛；u/v 是绝对位移（像素）
-static void hs_sor(const Img &a, const Img &b, std::vector<float> &u, std::vector<float> &v,
-                   int inner, float alpha2, float omega) {
-    const int w = a.w, h = a.h;
-    std::vector<float> Ix((size_t)w * h), Iy((size_t)w * h), It((size_t)w * h);
-    for (int y = 0; y < h; y++) {
-        for (int x = 0; x < w; x++) {
-            size_t i = (size_t)y * w + x;
-            float av = a.row(y)[x];
-            float bx = x + u[i], by = y + v[i];
-            float bv = bilin(b, bx, by);
-            float gxa = 0.5f * (bilin(a, x + 1.0f, (float)y) - bilin(a, x - 1.0f, (float)y));
-            float gya = 0.5f * (bilin(a, (float)x, y + 1.0f) - bilin(a, (float)x, y - 1.0f));
-            float gxb = 0.5f * (bilin(b, bx + 1.0f, by) - bilin(b, bx - 1.0f, by));
-            float gyb = 0.5f * (bilin(b, bx, by + 1.0f) - bilin(b, bx, by - 1.0f));
-            Ix[i] = 0.5f * (gxa + gxb);
-            Iy[i] = 0.5f * (gya + gyb);
-            It[i] = bv - av;   // 线性化 b(x+u) = a(x)：Ix*u + (b-a) = 0
-        }
-    }
-    for (int it = 0; it < inner; it++) {
-        for (int y = 0; y < h; y++) {
-            for (int x = 0; x < w; x++) {
-                size_t i = (size_t)y * w + x;
-                float us = 0, vs = 0; int n = 0;
-                if (x > 0) { us += u[i - 1]; vs += v[i - 1]; n++; }
-                if (x + 1 < w) { us += u[i + 1]; vs += v[i + 1]; n++; }
-                if (y > 0) { us += u[i - w]; vs += v[i - w]; n++; }
-                if (y + 1 < h) { us += u[i + w]; vs += v[i + w]; n++; }
-                if (!n) continue;
-                float ub = us / n, vb = vs / n;
-                float d = Ix[i] * ub + Iy[i] * vb + It[i];
-                float den = alpha2 + Ix[i] * Ix[i] + Iy[i] * Iy[i];
-                float nu = ub - Ix[i] * d / den;
-                float nv = vb - Iy[i] * d / den;
-                u[i] += omega * (nu - u[i]);
-                v[i] += omega * (nv - v[i]);
-                if (u[i] > 24.f) u[i] = 24.f;
-                if (u[i] < -24.f) u[i] = -24.f;
-                if (v[i] > 24.f) v[i] = 24.f;
-                if (v[i] < -24.f) v[i] = -24.f;
-            }
-        }
-        if (g_hsm) { gsmooth(u, w, h); gsmooth(v, w, h); }
-    }
-}
-
 
 // 低分辨率逐像素光流：把两帧缩到短边 ~g_ofres，在那一层跑逐像素 Gauss-Newton 金字塔，
 // 解完再双线性放大回全分辨率。流场尺度远小于画面，是这个方案能在手机上跑住的原因；
@@ -982,58 +935,6 @@ static void flow_gn_lowres(const Img &A, const Img &B, std::vector<Vec2> &out) {
         for (int it = 0; it < g_gnref; it++) flow_level(A, B, u, v, 1, g_gna);
         for (size_t i = 0; i < (size_t)w * h; i++) { out[i].x = u[i]; out[i].y = v[i]; }
     }
-}
-
-static void flow_hs(const Img &A, const Img &B, std::vector<Vec2> &out) {
-    float sc = (float)g_ofres / (float)std::max(1, std::min(A.w, A.h));
-    if (sc > 1.f) sc = 1.f;
-    int tw = std::max(16, (int)(A.w * sc)), th = std::max(16, (int)(A.h * sc));
-    Img a, b;
-    resize_area(A, a, tw, th);
-    resize_area(B, b, tw, th);
-
-    std::vector<Img> pa, pb;
-    pa.push_back(a); pb.push_back(b);
-    while ((int)pa.size() < 6 && std::min(pa.back().w, pa.back().h) > 40) {
-        Img na, nb;
-        down2(pa.back(), na); down2(pb.back(), nb);
-        pa.push_back(na); pb.push_back(nb);
-    }
-    vector<Vec2> field;
-    int pw = 0, ph = 0;
-    for (int l = (int)pa.size() - 1; l >= 0; l--) {
-        int w = pa[l].w, h = pa[l].h;
-        vector<Vec2> init((size_t)w * h, Vec2{0, 0});
-        if (pw && ph) init = upsample_scaled(field, pw, ph, w, h, 2.0f);
-        std::vector<float> u((size_t)w * h), v((size_t)w * h);
-        for (size_t i = 0; i < u.size(); i++) { u[i] = init[i].x; v[i] = init[i].y; }
-        for (int o = 0; o < g_hsout; o++) {
-            hs_sor(pa[l], pb[l], u, v, g_hsin, g_hsa, 1.6f);
-            vector<Vec2> tmp((size_t)w * h);
-            for (size_t i = 0; i < tmp.size(); i++) tmp[i] = Vec2{u[i], v[i]};
-            median3(tmp, w, h);
-            for (size_t i = 0; i < tmp.size(); i++) { u[i] = tmp[i].x; v[i] = tmp[i].y; }
-        }
-        field.resize((size_t)w * h);
-        for (size_t i = 0; i < field.size(); i++) field[i] = Vec2{u[i], v[i]};
-        pw = w; ph = h;
-    }
-    {
-        // 诊断：带流 warp 后的残差 vs 不带流
-        double r0 = 0, r1 = 0; long cnt = 0;
-        for (int y = 1; y + 1 < a.h; y++)
-            for (int x = 1; x + 1 < a.w; x++) {
-                size_t i = (size_t)y * a.w + x;
-                float ax = a.row(y)[x];
-                r0 += fabs(ax - (float)b.row(y)[x]);
-                r1 += fabs(ax - bilin(b, x + field[i].x, y + field[i].y));
-                cnt++;
-            }
-        double su = 0, sv = 0, sa = 0;
-        for (auto &q : field) { su += fabs(q.x); sv += fabs(q.y); sa += sqrt(q.x * q.x + q.y * q.y); }
-        double n = field.empty() ? 1 : (double)field.size();
-    }
-    out = upsample_scaled(field, tw, th, A.w, A.h, 1.0f);
 }
 
 // ---------------------------------------------------------------------------

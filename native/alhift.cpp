@@ -112,7 +112,7 @@ static void match_level(const Img &a, const Img &b, int B, int rad,
                 Vec2 iv = init[(size_t)by * nx + bx];
                 int cx = (int)lroundf(iv.x), cy = (int)lroundf(iv.y);
                 // 纹理强度决定惩罚力度：强边缘块上 SAD 有区分度，惩罚会把位移系统性缩短
-                // （实测 10px 平移被估成 8px，中间帧位置偏 20%）；平坦块上 SAD 无区分度，
+                // （不加惩罚时 10px 平移会被估成 8px 左右，中间帧位置前移）；平坦块上 SAD 无区分度，
                 // 反而要靠惩罚把矢量压回预测，避免乱跳。
                 float vsum = 0, vsum2 = 0; int vn = 0;
                 for (int y = py; y < std::min(py + B, a.h); y += 2) {
@@ -723,7 +723,7 @@ static void arbitrate(const Img &a, const Img &b, int W, int H,
 }
 
 // 分量中值：3×3 邻域对 u、v 分别取中值。比矢量中值快一个数量级（不用算两两距离），
-// 目的只是抹掉细长条纹；矢量中值实测只多 0.0002 SSIM，不值那 100 ms/帧。
+// 目的只是抹掉细长条纹；矢量中值几乎不涨分，却要多花约 100 ms/帧。
 static void vmedian3(std::vector<Vec2> &f, int w, int h) {
     std::vector<Vec2> src = f;
     for (int y = 0; y < h; y++)
@@ -1029,11 +1029,9 @@ static void flow_hs(const Img &A, const Img &B, std::vector<Vec2> &out) {
                 r1 += fabs(ax - bilin(b, x + field[i].x, y + field[i].y));
                 cnt++;
             }
-        if (cnt) fprintf(stderr, "hs resid noflow=%.2f withflow=%.2f\n", r0 / cnt, r1 / cnt);
         double su = 0, sv = 0, sa = 0;
         for (auto &q : field) { su += fabs(q.x); sv += fabs(q.y); sa += sqrt(q.x * q.x + q.y * q.y); }
         double n = field.empty() ? 1 : (double)field.size();
-        fprintf(stderr, "hs field %dx%d mean|u|=%.3f mean|v|=%.3f mean|f|=%.3f\n", tw, th, su / n, sv / n, sa / n);
     }
     out = upsample_scaled(field, tw, th, A.w, A.h, 1.0f);
 }
@@ -1201,7 +1199,6 @@ static void flow_dis(const Img &A, const Img &B, std::vector<Vec2> &out) {
         for (size_t q = 0; q < u.size(); q += 7) mags.push_back(std::fabs(u[q]));
         std::sort(mags.begin(), mags.end());
         float p50 = mags.empty() ? 0.f : mags[mags.size() / 2];
-        fprintf(stderr, "dis lvl=%d %dx%d p50=%.2f\n", l, a.w, a.h, p50);
         int P = (l == L - 1) ? 16 : (l == L - 2 ? 12 : 8);
         if (!g_resid) {
             patch_pass(a, b, u, v, P, P / 2, g_dms);
@@ -1354,7 +1351,7 @@ int main(int argc, char **argv) {
             penFixed = true;
             // 去重阈值跟着噪声走：干净片 0.8 够用；颗粒重的片子必须放宽，
             // 否则静止镜头的帧间差被噪声顶起来，永远判不出重复。
-            // 实测：纯噪声静止画面的帧间 MAD ≈ 1.5σ，真实运动画面 ≥ 3σ，
+            // 纯噪声静止画面的帧间 MAD ≈ 1.5σ，真实运动画面 ≥ 3σ，
             // 所以阈值取 1.6σ 能把"颗粒噪点"判成静止，同时不误吃真实运动。
             if (g_dupThr < 0.f) {
                 g_dupThr = 1.6f * sg;
@@ -1400,7 +1397,7 @@ int main(int argc, char **argv) {
             }
         }
 
-        fprintf(stderr, "k=%d pyr\n", k);
+        fprintf(stderr, "k=%d\n", k);
         // 金字塔
         pa[0] = a; pb[0] = b;
         if (opt & 8192) { blur3(pa[0]); blur3(pb[0]); }
@@ -1423,7 +1420,7 @@ int main(int argc, char **argv) {
                     bool prevOk = false;
                     if (!g_prevF.empty()) {
                         // 只有上一对帧的运动本身很小（<2 px）时，才拿它的场当初值：
-                        // 运动大时旧场是过期的，会把搜索带进错误盆地（实测 1080p 直接掉 0.009）。
+                        // 运动大时旧场是过期的，会把搜索带进错误盆地（运动大时会让整场分数明显下降）。
                         float acc = 0;
                         size_t cnt = g_prevF.size();
                         for (size_t i = 0; i < cnt; i++) acc += fabsf(g_prevF[i].x) + fabsf(g_prevF[i].y);
@@ -1503,7 +1500,6 @@ int main(int argc, char **argv) {
                 cur.swap(dense);
             }
             nbw = W; nbh = H;
-            fprintf(stderr, "k=%d flow dense\n", k);
         } else if (opt & 2048) {
             // 块场细化：块匹配先定大位移，再把块矢量双线性铺到每个像素，
             // 用全分辨率 GN 迭代几轮把场抹平、补到亚像素——精度来自块匹配，
@@ -1562,7 +1558,6 @@ int main(int argc, char **argv) {
             match_level(pa[0], pb[0], B2, 2, init, res, cost, rw, rh);
             cur = res; nbw = rw; nbh = rh;
         }
-        fprintf(stderr, "k=%d match done %dx%d\n", k, nbw, nbh);
         int B = (opt & (8388608 | 1073741824 | 4194304 | 2048)) ? 1 : ((opt & 8) ? 4 : 8), bw = nbw, bh = nbh;
         if (B > 1) median3(cur, bw, bh);
         if (opt & 16) { median3(cur, bw, bh); median3(cur, bw, bh); }   // 多遍中值：压块状拼布
@@ -1602,7 +1597,6 @@ int main(int argc, char **argv) {
             }
         }
 
-        fprintf(stderr, "k=%d conf done\n", k);
         // 稠密光流档：用前后向一致性标出遮挡像素，合成时那里只取一侧，避免双影
         std::vector<uint8_t> occ;
         if ((opt & 1073741824) && g_occ) fb_occlusion(cur, gfield, W, H, 1.5f, occ);
@@ -1731,7 +1725,7 @@ int main(int argc, char **argv) {
                     if (wsum <= 1e-4f) {
                         val = tm;
                     } else if (opt & 4194304) {
-                        // 双向稠密光流合成（NodeVideo 那一路）：可见性由前后向一致性
+                        // 双向稠密光流合成：可见性由前后向一致性
                         // |F(p)+G(p+F)| 给出，误差小=两侧都能看见=按 t 混合；误差大=一侧被遮挡，
                         // 只信另一侧。系数取流场尺度（1.5px），不是灰度尺度。
                         Vec2 v = sample_vec_b(cur, bw, bh, 1, (float)x, (float)y);

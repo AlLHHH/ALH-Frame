@@ -33,9 +33,9 @@ public class Engine {
 
     /**
      * minterpolate 的固定尾巴。
-     * me_mode 用 bilat（双侧匹配）而不是 bidir：实测同画质下快 1.5–1.7 倍，
-     * 4x 档位下画质反而更高（大位移时 bidir 的平均更早失效）。
-     * 其余参数维持标定值：aobmc 重叠块补偿、epzs 搜索、16px 块、场景切换自检。
+     * me_mode 用 bilat（双侧匹配）而不是 bidir：同画质下更快，4x 档位画质也更高
+     * （大位移时 bidir 的双向平均更早失效）。
+     * 其余参数：aobmc 重叠块补偿、epzs 搜索、16px 块、场景切换自检。
      */
     /** 临时目录的清理与创建必须串行，否则启动时的后台清理会和开工清理互相踩。 */
     static final Object CACHE_LOCK = new Object();
@@ -351,8 +351,8 @@ public class Engine {
         }
         cap = Math.min(cap, Math.max(1, totalOut / 24));
 
-        // 每路峰值内存（MB）按实测校过：1080×1620 单路实测 762 MB，
-        // 其中约 200 MB 是固定开销，余下跟像素量走。乘 0.6 把余量留给系统。
+        // 每路峰值内存（MB）：1080×1620 约 762 MB，其中 200 MB 左右是固定开销，
+        // 其余随像素量增长。乘 0.6 把余量留给系统。
         double mp = (double) ii.w * ii.h / 1000000.0;
         double perWorkerMb = Math.max(360, 200 + 220 * mp);
         long mem = memAvailableMb();
@@ -656,9 +656,9 @@ public class Engine {
                 note("pro", out.getName() + " 改走 ffmpeg 路径重跑");
             }
             StringBuilder vf = new StringBuilder();
-            // 两条禁忌，都实测过：
-            // 1) 不能用 pad —— ffmpeg 9.0.2 在 1080×1620 上 pad+minterpolate 必崩，不补边反而正常；
-            // 2) 不能在 minterpolate 前面挂 tpad —— 那是把克隆帧喂进运动估计，片尾必崩。
+            // 两条禁忌：
+            // 1) 不能用 pad —— 在 1080×1620 上 pad+minterpolate 会崩，不补边反而正常；
+            // 2) 不能在 minterpolate 前面挂 tpad —— 等于把克隆帧喂进运动估计，片尾会崩。
             if (attempt >= 6) {
                 // 最后一档：完全不用 minterpolate，纯插帧复制。质量等同 30fps 内容放 96fps，
                 // 但这条路径只碰 fps 滤镜，任何机型都能跑完。
@@ -812,8 +812,7 @@ public class Engine {
             double ratio = outFps / srcFps;
             int nfr = Math.max(2, (int) Math.ceil(want * srcFps) + 1);
             int o;
-            // 档位差别在匹配窗大小与精修开关，实测（12 帧统一口径）：
-            // 360p 0.9944/0.9960；720p 0.9925/0.9952；1080p 0.9923/0.9947/0.9952；1440p 0.9925/0.9947/0.9948。
+            // 档位差别在匹配窗大小、OBMC 邻域与精修开关，窗越宽越稳、耗时越长。
             switch (profile) {
                 case 2:  o = 306610177; break;   // Pro：稠密光流为主，逐像素与块场择优，细节补偿收尾
                 case 1:  o = 33980417; break;            // Standard：rad8 + 反向候选 + 亚像素

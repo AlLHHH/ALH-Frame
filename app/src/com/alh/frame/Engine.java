@@ -827,12 +827,12 @@ public class Engine {
             // 匹配窗随档位放大：窗越大梯度越稳，代价按窗面积涨。4K 上窗太宽会拖很久，降到 6。
             int shortSide = Math.min(vw, vh);
             long px = (long) vw * vh;
-            int win = profile == 2 ? (px > 6000000L ? 6 : 8) : (profile == 1 ? 4 : 2);
+            int win = profile == 2 ? (px > 6000000L ? 6 : 8) : (profile == 1 ? 6 : 2);
             String env = "ALH_WIN=" + win + " ";
             if (profile != 0) env += "ALH_JBU=1 ALH_BICU=1 ";
             if (profile == 2) env += "ALH_OFRES=" + (px > 1000000L ? 400 : 250) + " ALH_GNREF=3 ALH_GNA=0.6 ALH_GNS=1 ";
             if (profile == 2) win = 0;
-            if (profile == 1) env += "ALH_PM=2 ALH_OB3=1 ALH_OBW=16 ";
+            if (profile == 1) env += "ALH_OB3=3 ALH_OBW=32 ";
             if (profile == 2) env += "ALH_ITER=1 ";
             StringBuilder sb = new StringBuilder();
             sb.append(q(ff)).append(" -hide_banner -nostdin -v error -ss ").append(ss)

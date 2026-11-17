@@ -65,7 +65,9 @@ static int g_seed = 8;        // 最粗层全局平移种子搜索半径（0=关
 static int g_cos = 0;         // 混合权重用余弦缓动（1=开）
 static int g_occ = 1;         // 遮挡区只取单侧（0=退回两侧混合）
 static float g_shp = 0.35f;   // 细节回注强度：把 warp 后的高频加回去，抵消插值的低通
-static float g_ft2 = 0.0f;    // 光流档：逐像素场的时域平滑权重（0=关，越大越稳但越迟滞）
+static float g_ft2 = 0.0f;
+static float g_mrg = 1.0f;    // 自适应分块：平坦区把邻块合成大块，接缝少一半
+static float g_bth = 0.5f;   // 块场时域迟滞：小幅变化才融合，压掉逐对帧的块抖动    // 光流档：逐像素场的时域平滑权重（0=关，越大越稳但越迟滞）
 
 // 噪声估计：拉普拉斯响应的 MAD/6 ≈ 高斯噪声 σ（灰阶）
 static float y_sigma(const Img &a) {
@@ -1201,6 +1203,8 @@ int main(int argc, char **argv) {
     if (const char *e = getenv("ALH_OFRES")) g_ofres = atoi(e);
     if (const char *e = getenv("ALH_GNREF")) g_gnref = atoi(e);
     if (const char *e = getenv("ALH_FT2")) g_ft2 = (float)atof(e);
+    if (const char *e = getenv("ALH_MRG")) g_mrg = (float)atof(e);
+    if (const char *e = getenv("ALH_BTH")) g_bth = (float)atof(e);
     if (const char *e = getenv("ALH_SHP")) g_shp = (float)atof(e);
     if (const char *e = getenv("ALH_GNA")) g_gna = (float)atof(e);
     if (const char *e = getenv("ALH_GNS")) g_gns = atoi(e);
@@ -1472,6 +1476,73 @@ int main(int argc, char **argv) {
         fprintf(stderr, "k=%d match done %dx%d\n", k, nbw, nbh);
         int B = (opt & (8388608 | 1073741824 | 4194304 | 2048)) ? 1 : ((opt & 8) ? 4 : 8), bw = nbw, bh = nbh;
         if (B > 1) median3(cur, bw, bh);
+        // 自适应分块：8×8 块若用邻块平均矢量（相当于 24×24 的大块）代价几乎不升，
+        // 说明这块在平坦区/弱纹理区，块越小接缝越多、矢量越容易逐帧乱跳——直接合并成块。
+        long mcnt = 0;
+        if (B == 8 && g_mrg > 0.0f && bw > 1 && bh > 1) {
+            vector<Vec2> srcv = cur;
+            for (int by = 0; by < bh; by++) {
+                for (int bx = 0; bx < bw; bx++) {
+                    int x0 = std::max(0, bx - 1), x1 = std::min(bw - 1, bx + 1);
+                    int y0 = std::max(0, by - 1), y1 = std::min(bh - 1, by + 1);
+                    float ax = 0, ay = 0; int n = 0;
+                    for (int yy = y0; yy <= y1; yy++) {
+                        for (int xx = x0; xx <= x1; xx++) {
+                            ax += srcv[(size_t)yy * bw + xx].x;
+                            ay += srcv[(size_t)yy * bw + xx].y;
+                            n++;
+                        }
+                    }
+                    Vec2 own = srcv[(size_t)by * bw + bx];
+                    int px = bx * B, py = by * B;
+                    // 块内纹理强度：平坦块的匹配本来就没有唯一解，随便一个矢量都能"对得上"，
+                    // 于是相邻帧之间来回跳 —— 这就是看到的那块在闪。平坦块改用邻域中值矢量。
+                    int x1b = std::min(px + B, W), y1b = std::min(py + B, H);
+                    float m = 0, m2 = 0; int nt = 0;
+                    for (int y = py; y < y1b; y += 2) {
+                        const uint8_t *r = pa[0].row(y);
+                        for (int x = px; x < x1b; x += 2) { m += r[x]; m2 += (float)r[x] * r[x]; nt++; }
+                    }
+                    float var = nt ? m2 / nt - (m / nt) * (m / nt) : 0.0f;
+                    if (var < 45.0f) {
+                        // 邻域中值：比平均值更不容易被一个错块带偏
+                        float xs[9], ys[9]; int k9 = 0;
+                        for (int yy = y0; yy <= y1; yy++) {
+                            for (int xx = x0; xx <= x1; xx++) {
+                                xs[k9] = srcv[(size_t)yy * bw + xx].x;
+                                ys[k9] = srcv[(size_t)yy * bw + xx].y;
+                                k9++;
+                            }
+                        }
+                        for (int i = 0; i < k9; i++) {
+                            for (int j = i + 1; j < k9; j++) {
+                                if (xs[j] < xs[i]) { float t0 = xs[i]; xs[i] = xs[j]; xs[j] = t0; }
+                                if (ys[j] < ys[i]) { float t0 = ys[i]; ys[i] = ys[j]; ys[j] = t0; }
+                            }
+                        }
+                        cur[(size_t)by * bw + bx] = Vec2{xs[k9 / 2], ys[k9 / 2]}; mcnt++;
+                    } else {
+                        Vec2 par{ax / n, ay / n};
+                        float c_own = sad_at(pa[0], pb[0], px, py, B, own.x, own.y);
+                        float c_par = sad_at(pa[0], pb[0], px, py, B, par.x, par.y);
+                        if (c_par <= c_own * 1.12f + 0.4f) { cur[(size_t)by * bw + bx] = par; mcnt++; }
+                    }
+                }
+            }
+        }
+        // 块场时域平滑：矢量差越小、融合越重（exp 权重），差得大就原样保留，避免拖影。
+        // 这里解决的是"同一个块在两对帧之间来回跳半个到两个像素"，插值帧内容跟着跳 = 看到的那块在闪。
+        static vector<Vec2> prevB; static int prevBw = 0, prevBh = 0;
+        if (g_bth > 0.0f && prevB.size() == cur.size() && prevBw == bw && prevBh == bh) {
+            const float S2 = 2.0f * 1.5f * 1.5f;
+            for (size_t i = 0; i < cur.size(); i++) {
+                float dx = cur[i].x - prevB[i].x, dy = cur[i].y - prevB[i].y;
+                float w = g_bth * expf(-(dx * dx + dy * dy) / S2);
+                cur[i].x = (1 - w) * cur[i].x + w * prevB[i].x;
+                cur[i].y = (1 - w) * cur[i].y + w * prevB[i].y;
+            }
+        }
+        if (g_bth > 0.0f) { prevB = cur; prevBw = bw; prevBh = bh; }
         if (opt & 16) { median3(cur, bw, bh); median3(cur, bw, bh); }   // 多遍中值：压块状拼布
         if (B > 1) {
             if (opt & 1) refine_sub(pa[0], pb[0], cur, B, bw, bh);
@@ -1644,7 +1715,10 @@ int main(int argc, char **argv) {
                         bool ok1 = bxx >= 0 && byy >= 0 && bxx <= W - 1 && byy <= H - 1;
                         float ha = ok0 ? bilin(a, axx, ayy) - bilin(ablur, axx, ayy) : 0.0f;
                         float hb = ok1 ? bilin(b, bxx, byy) - bilin(bblur, bxx, byy) : 0.0f;
-                        val += g_shp * ((1.0f - t) * ha + t * hb);
+                        // 两帧同一位置的高频取平均，而不是按 t 加权：
+                        // 静止区的真实纹理在两帧里是一致的，按 t 加权只会把两帧的噪声差异
+                        // 变成一个随时间起伏的高频——那就是眼睛看到的"这块在闪"。
+                        val += g_shp * (0.5f * (ha + hb));
                     }
                     oy[(size_t)y * W + x] = (uint8_t)std::max(0, std::min(255, (int)lroundf(val)));
                 }

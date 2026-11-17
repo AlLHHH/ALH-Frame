@@ -64,6 +64,7 @@ static int g_pass = 3;        // 每层 patch 迭代遍数（调参用）
 static int g_seed = 8;        // 最粗层全局平移种子搜索半径（0=关）
 static int g_cos = 0;         // 混合权重用余弦缓动（1=开）
 static int g_occ = 1;         // 遮挡区只取单侧（0=退回两侧混合）
+static float g_shp = 0.35f;   // 细节回注强度：把 warp 后的高频加回去，抵消插值的低通
 static float g_ft2 = 0.0f;    // 光流档：逐像素场的时域平滑权重（0=关，越大越稳但越迟滞）
 
 // 噪声估计：拉普拉斯响应的 MAD/6 ≈ 高斯噪声 σ（灰阶）
@@ -1200,6 +1201,7 @@ int main(int argc, char **argv) {
     if (const char *e = getenv("ALH_OFRES")) g_ofres = atoi(e);
     if (const char *e = getenv("ALH_GNREF")) g_gnref = atoi(e);
     if (const char *e = getenv("ALH_FT2")) g_ft2 = (float)atof(e);
+    if (const char *e = getenv("ALH_SHP")) g_shp = (float)atof(e);
     if (const char *e = getenv("ALH_GNA")) g_gna = (float)atof(e);
     if (const char *e = getenv("ALH_GNS")) g_gns = atoi(e);
     if (const char *e = getenv("ALH_JBU")) g_jbu = atoi(e);
@@ -1304,6 +1306,9 @@ int main(int argc, char **argv) {
         }
 
         fprintf(stderr, "k=%d pyr\n", k);
+        // 细节回注用的低通参考：每对帧只算一次，比在像素循环里做 9 抽样便宜得多
+        Img ablur, bblur;
+        if (g_shp > 0.0f) { ablur = a; bblur = b; blur3(ablur); blur3(bblur); }
         // 金字塔
         pa[0] = a; pb[0] = b;
         if (opt & 8192) { blur3(pa[0]); blur3(pb[0]); }
@@ -1630,6 +1635,17 @@ int main(int argc, char **argv) {
                     // 遮挡区只取一侧：被遮住的那一侧本来就看不到，混进来就是双影
                     if (!occ.empty() && occ[(size_t)y * W + x])
                         val = (g_occ == 2) ? tm : ((t < 0.5f) ? P0 : P1);
+                    if (g_shp > 0.0f) {
+                        // warp 后的高频加回去：插值天然低通，这一步把轮廓和纹理找回来
+                        Vec2 vv = sample_vec_b(cur, bw, bh, B, x, y);
+                        float axx = x - vv.x * t, ayy = y - vv.y * t;
+                        float bxx = x + vv.x * (1 - t), byy = y + vv.y * (1 - t);
+                        bool ok0 = axx >= 0 && ayy >= 0 && axx <= W - 1 && ayy <= H - 1;
+                        bool ok1 = bxx >= 0 && byy >= 0 && bxx <= W - 1 && byy <= H - 1;
+                        float ha = ok0 ? bilin(a, axx, ayy) - bilin(ablur, axx, ayy) : 0.0f;
+                        float hb = ok1 ? bilin(b, bxx, byy) - bilin(bblur, bxx, byy) : 0.0f;
+                        val += g_shp * ((1.0f - t) * ha + t * hb);
+                    }
                     oy[(size_t)y * W + x] = (uint8_t)std::max(0, std::min(255, (int)lroundf(val)));
                 }
             }

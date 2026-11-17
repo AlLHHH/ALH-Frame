@@ -830,8 +830,8 @@ public class Engine {
             String env = "ALH_WIN=" + win + " ";
             if (profile != 0) env += "ALH_JBU=1 ALH_BICU=1 ";
             if (profile == 2) env += "ALH_OFRES=" + (px > 1000000L ? 400 : 250)
-                    + " ALH_GNREF=3 ALH_GNA=0.6 ALH_GNS=1 ALH_SHP=0.2 ALH_OB3=3 ALH_OBW=32 ALH_FT2=0.8 ";
-            if (profile == 1) env += "ALH_OB3=1 ALH_OBW=16 ";
+                    + " ALH_GNREF=3 ALH_GNA=0.6 ALH_GNS=1 ALH_SHP=0.35 ALH_OB3=3 ALH_OBW=32 ALH_FT2=0.8 ";
+            if (profile == 1) env += "ALH_OB3=1 ALH_OBW=16 ALH_SHP=0.25 ";
             StringBuilder sb = new StringBuilder();
             sb.append(q(ff)).append(" -hide_banner -nostdin -v error -ss ").append(ss)
                     .append(" -t ").append(fmt(want))
